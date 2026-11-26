@@ -16,6 +16,16 @@ The Express application exports an API handler and includes Vercel function rout
 
 To connect each separately hosted frontend build to the backend, edit the `api-base` meta tag near the top of both `index.html` and `admin.html` to the API's public origin, for example `<meta name="api-base" content="https://your-api.example.com" />`. This is the frontend build's backend link; leave off the trailing slash and rebuild/re-upload the static files after changing it. Alternatively, define `window.API_URL` before the page's main script. Set `ALLOWED_ORIGINS` on the API to the exact frontend origin(s), comma-separated, so browser API requests pass CORS checks. Open `https://your-api.example.com/api/health` to verify the API and Turso connection.
 
+### Render
+
+This repository includes `render.yaml` for the API web service. Create or update a Render Blueprint from the repository, then set the prompted `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `ADMIN_PASSCODE`, `JWT_SECRET`, and `ALLOWED_ORIGINS` values in Render's environment settings. The Render log shown when these are absent means those secrets have not been added to the service; `.env` is intentionally ignored by Git and is not uploaded to Render. Keep `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` from the same Turso database. Set `ALLOWED_ORIGINS` to the exact static frontend origins (comma-separated). Add the four `EMAILJS_*` values too if password reset email is enabled. Render supplies `PORT`; the server listens on it. The health check is `/api/health`.
+
+For an existing Render web service, use build command `npm install`, start command `npm start`, and health check path `/api/health`, then add the required environment variables under **Environment** and redeploy. Do not copy secret values into `render.yaml`.
+
+### Vercel
+
+Set the same required server-side environment variables in the Vercel project's **Settings → Environment Variables**. Vercel's `api/` functions route API requests; do not configure this project to deploy the frontend. If a required variable is missing, the server reports its name at startup. The frontend remains a separate static deployment.
+
 ## Frontend and local preview
 
 For local preview on ports 3000, 5173, 5500, or 5501, the pages connect to port 4000 on the same host name as the page (so another device on your network can reach the backend). Keep `.env` and all database/authentication credentials on the server; do not publish them in frontend code.

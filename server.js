@@ -36,11 +36,19 @@ const PROPERTY_TYPES = [
   'Lodging',
 ];
 
-if (!/^(libsql:\/\/|https:\/\/)/.test(TURSO_DATABASE_URL) || !TURSO_AUTH_TOKEN) {
-  throw new Error('Configure TURSO_DATABASE_URL (remote libsql:// or https://) and TURSO_AUTH_TOKEN; local databases are not supported.');
+const missingRequiredEnvironment = [
+  ['TURSO_DATABASE_URL', TURSO_DATABASE_URL],
+  ['TURSO_AUTH_TOKEN', TURSO_AUTH_TOKEN],
+  ['ADMIN_PASSCODE', ADMIN_PASSCODE],
+].filter(([, value]) => !value.trim()).map(([key]) => key);
+if (missingRequiredEnvironment.length) {
+  throw new Error(
+    `Missing required environment variables: ${missingRequiredEnvironment.join(', ')}. ` +
+    'Add them in the hosting service environment settings; local .env files are not deployed automatically.',
+  );
 }
-if (!ADMIN_PASSCODE) {
-  throw new Error('Configure ADMIN_PASSCODE before starting the server.');
+if (!/^(libsql:\/\/|https:\/\/)/.test(TURSO_DATABASE_URL)) {
+  throw new Error('TURSO_DATABASE_URL must be a remote Turso libsql:// or https:// URL; local databases are not supported.');
 }
 
 const db = createClient({
