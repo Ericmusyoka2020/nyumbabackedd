@@ -3,12 +3,44 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <!-- Set content to your separately hosted API origin when deploying this frontend. -->
-  <meta name="api-base" content="" />
+  <!-- Replace with the deployed API origin when publishing this frontend. -->
+  <meta name="api-base" content="http://localhost:4000" />
   <title>HouseHunter — Houses & Landlord Portal</title>
   <script src="https://cdn.tailwindcss.com" defer></script>
   <style>
     .text-xs { font-size: .875rem; line-height: 1.25rem; }
+    html { background: #f8fafc; }
+    body { background: #f8fafc; color: #0f172a; }
+    body > header, body > footer, #publicSection > section:first-child,
+    #housesList article, #housesList article > div { background-color: #fff; }
+    #publicSection { color: #0f172a; }
+    #publicSection input, #publicSection select {
+      color: #0f172a;
+      background-color: #fff;
+      border: 1px solid #cbd5e1;
+    }
+    #housesList img { background: #e2e8f0; }
+    #initialListingsMessage {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: .75rem;
+      min-height: 7rem;
+      border: 1px solid #d1fae5;
+      border-radius: .75rem;
+      background: linear-gradient(110deg, #fff 0%, #f0fdf4 50%, #fff 100%);
+      color: #065f46;
+      font-weight: 600;
+    }
+    .listing-loader {
+      width: 1.25rem;
+      height: 1.25rem;
+      border: 3px solid #a7f3d0;
+      border-top-color: #059669;
+      border-radius: 50%;
+      animation: listing-spin .8s linear infinite;
+    }
+    @keyframes listing-spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen flex flex-col">
@@ -152,7 +184,9 @@
       <span class="col-span-full text-sm text-slate-500">Results update as you type or change filters.</span>
     </section>
 
-    <section id="housesList" class="grid grid-cols-1 md:grid-cols-3 gap-4"></section>
+    <section id="housesList" class="grid grid-cols-1 md:grid-cols-3 gap-4" aria-live="polite" aria-busy="true">
+      <div id="initialListingsMessage" class="col-span-full rounded-xl p-8 text-center shadow-sm"><span class="listing-loader" aria-hidden="true"></span><span>Loading available listings…</span></div>
+    </section>
   </main>
 
   <!-- PROPERTY DETAILS, PHOTO GALLERY & REPORT MODAL -->
@@ -882,11 +916,17 @@
         if (searchController) searchController.abort();
         searchController = new AbortController();
         const requestSequence = ++searchSequence;
+        const container = document.getElementById('housesList');
+        container.setAttribute('aria-busy', 'true');
+        if (!allHouses.length) {
+          container.innerHTML = '<div id="initialListingsMessage" class="col-span-full rounded-xl p-8 text-center shadow-sm"><span class="listing-loader" aria-hidden="true"></span><span>Loading available listings…</span></div>';
+        }
         const res = await fetch(`${API_URL}/api/properties?${params.toString()}`, { signal: searchController.signal });
         if (requestSequence !== searchSequence) return;
         const data = await res.json();
+        if (!res.ok || !data.success) throw new Error(data.message || 'Could not load listings.');
         allHouses = data.data || [];
-        const container = document.getElementById('housesList');
+        container.setAttribute('aria-busy', 'false');
 
         if (!allHouses.length) {
           container.innerHTML = `<div class="col-span-full bg-white p-8 rounded-xl border text-center text-slate-500">No approved houses match your search.</div>`;
@@ -945,6 +985,14 @@
       if (btn) return runWithButtonFeedback(btn, exec, 'Searching...', 'Searched');
       return exec().catch((error) => {
         if (error.name === 'AbortError') return null;
+        const container = document.getElementById('housesList');
+        container.setAttribute('aria-busy', 'false');
+        if (!allHouses.length) {
+          container.innerHTML = `<div class="col-span-full rounded-xl border border-amber-300 bg-amber-50 p-8 text-center text-amber-900 shadow-sm">
+            <p class="font-semibold">${error.message || 'Could not load listings.'}</p>
+            <button type="button" onclick="loadHouses()" class="mt-3 rounded-lg border border-amber-400 bg-white px-4 py-2 text-sm font-semibold">Try again</button>
+          </div>`;
+        }
         banner(error.message || 'Could not load houses.');
         return null;
       });
