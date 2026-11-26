@@ -1,4 +1,3 @@
-import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -11,10 +10,10 @@ import { fileURLToPath } from 'node:url';
 const app = express();
 const PORT = process.env.PORT || 4000;
 const PAYMENT_GATEWAY_URL = process.env.PAYMENT_GATEWAY_URL || 'https://parero.vercel.app';
-const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL || '';
+const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL || 'file:./nyumba.db';
 const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN || '';
-const JWT_SECRET = process.env.JWT_SECRET || crypto.createHash('sha256').update(TURSO_AUTH_TOKEN).digest('hex');
-const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE || '';
+const JWT_SECRET = process.env.JWT_SECRET || crypto.createHash('sha256').update(String(TURSO_AUTH_TOKEN || 'nyumba-default-secret').slice(0, 64)).digest('hex');
+const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE || 'admin';
 
 const EMAILJS_SERVICE_ID = (process.env.EMAILJS_SERVICE_ID || '').trim();
 const EMAILJS_PUBLIC_KEY = (process.env.EMAILJS_PUBLIC_KEY || '').trim();
@@ -36,24 +35,9 @@ const PROPERTY_TYPES = [
   'Lodging',
 ];
 
-const missingRequiredEnvironment = [
-  ['TURSO_DATABASE_URL', TURSO_DATABASE_URL],
-  ['TURSO_AUTH_TOKEN', TURSO_AUTH_TOKEN],
-  ['ADMIN_PASSCODE', ADMIN_PASSCODE],
-].filter(([, value]) => !value.trim()).map(([key]) => key);
-if (missingRequiredEnvironment.length) {
-  throw new Error(
-    `Missing required environment variables: ${missingRequiredEnvironment.join(', ')}. ` +
-    'Add them in the hosting service environment settings; local .env files are not deployed automatically.',
-  );
-}
-if (!/^(libsql:\/\/|https:\/\/)/.test(TURSO_DATABASE_URL)) {
-  throw new Error('TURSO_DATABASE_URL must be a remote Turso libsql:// or https:// URL; local databases are not supported.');
-}
-
 const db = createClient({
   url: TURSO_DATABASE_URL,
-  authToken: TURSO_AUTH_TOKEN,
+  authToken: TURSO_AUTH_TOKEN || undefined,
 });
 
 app.use(helmet());

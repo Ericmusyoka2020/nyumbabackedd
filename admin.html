@@ -151,14 +151,7 @@
   </footer>
 
   <script>
-    const previewPort = ['3000', '5173', '5500', '5501'].includes(location.port);
-    const previewProtocol = location.protocol === 'https:' ? 'https:' : 'http:';
-    const configuredApiUrl = document.querySelector('meta[name="api-base"]')?.content.trim();
-    const API_URL = String(window.API_URL || configuredApiUrl || (
-      location.protocol === 'file:' || previewPort
-        ? `${previewProtocol}//${location.hostname || 'localhost'}:4000`
-        : location.origin
-    )).replace(/\/+$/, '');
+    const API_URL = 'http://localhost:4000';
     let adminToken = sessionStorage.getItem('hh_admin_token') || '';
     let adminProperties = [];
     document.getElementById('currentYear').textContent = new Date().getFullYear();
