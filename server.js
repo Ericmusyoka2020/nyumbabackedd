@@ -35,6 +35,7 @@ const PROPERTY_TYPES = [
   'Apartment',
   'House',
   'Lodging',
+  'Cottage',
 ];
 
 const db = createClient({
@@ -845,6 +846,10 @@ app.post('/api/properties', requireAuth, async (req, res) => {
     if (!propertyTypes.length) {
       return res.status(400).json({ success: false, message: 'Select at least one valid property type in this building.' });
     }
+    const rentAmount = Number(b.rent_amount ?? b.min_rent ?? b.monthly_rent ?? 0);
+    if (!Number.isFinite(rentAmount) || rentAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'Enter a valid listing price greater than zero.' });
+    }
 
     const cfg = await getConfig();
     const freeAllowed = Number(cfg.free_posts_allowed || 1);
@@ -853,9 +858,9 @@ app.post('/api/properties', requireAuth, async (req, res) => {
 
     let sub = (await db.execute({
       sql: `SELECT * FROM subscriptions
-            WHERE user_id = ? AND status = 'ACTIVE' AND posts_used < posts_total AND expires_at > datetime('now')
+            WHERE user_id = ? AND status = 'ACTIVE' AND posts_used < posts_total AND expires_at > ?
             ORDER BY created_at ASC LIMIT 1`,
-      args: [req.user.id],
+      args: [req.user.id, new Date().toISOString()],
     })).rows[0];
 
     if (!sub && req.user.free_post_used < freeAllowed) {
@@ -877,8 +882,8 @@ app.post('/api/properties', requireAuth, async (req, res) => {
 
     const propertyType = propertyTypes[0];
     const title = String(b.title || '').trim() || `${propertyTypes.join(', ')} Listing`;
-    const minRent = Number(b.min_rent ?? b.monthly_rent ?? 0);
-    const maxRent = Number(b.max_rent ?? b.monthly_rent ?? minRent);
+    const minRent = rentAmount;
+    const maxRent = rentAmount;
     const rentPeriod = ['DAY', 'NIGHT', 'MONTH', 'YEAR'].includes(b.rent_period) ? b.rent_period : 'MONTH';
     const requestedAvailability = b.availability_status === 'OCCUPIED' ? 'OCCUPIED' : 'PENDING_APPROVAL';
     const images = Array.isArray(b.images) ? b.images.slice(0, 4) : [];
@@ -941,8 +946,12 @@ app.put('/api/user/properties/:id', requireAuth, async (req, res) => {
     if (!propertyTypes.length) {
       return res.status(400).json({ success: false, message: 'Select at least one valid property type in this building.' });
     }
-    const minRent = b.min_rent !== undefined ? Number(b.min_rent) : Number(existing.min_rent);
-    const maxRent = b.max_rent !== undefined ? Number(b.max_rent) : Number(existing.max_rent);
+    const rentAmount = Number(b.rent_amount ?? b.min_rent ?? existing.min_rent ?? existing.monthly_rent);
+    if (!Number.isFinite(rentAmount) || rentAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'Enter a valid listing price greater than zero.' });
+    }
+    const minRent = rentAmount;
+    const maxRent = rentAmount;
 
     const existingImgs = JSON.parse(existing.images_json || '[]');
     const finalImgs = Array.isArray(b.kept_images)
@@ -1278,6 +1287,108 @@ app.patch('/api/admin/properties/:id/restore', requireAdmin, async (req, res) =>
   return res.json({ success: true, message: 'Listing restored' });
 });
 
+app.put('/api/admin/properties/:id', requireAdmin, async (req, res) => {
+  const existing = (await db.execute({
+    sql: 'SELECT * FROM properties WHERE id = ?',
+    args: [req.params.id],
+  })).rows[0];
+  if (!existing) return res.status(404).json({ success: false, message: 'Listing not found.' });
+
+  const body = req.body || {};
+  const title = String(body.title ?? existing.title).trim();
+  if (!title) return res.status(400).json({ success: false, message: 'A listing name is required.' });
+  const currentTypes = normalizePropertyTypes(JSON.parse(existing.property_types_json || '[]'), existing.property_type);
+  const propertyTypes = body.property_types !== undefined
+    ? normalizePropertyTypes(body.property_types, body.property_type)
+    : currentTypes;
+  if (!propertyTypes.length) {
+    return res.status(400).json({ success: false, message: 'Select at least one valid property type.' });
+  }
+  const rentAmount = Number(body.rent_amount ?? existing.min_rent ?? existing.monthly_rent);
+  if (!Number.isFinite(rentAmount) || rentAmount <= 0) {
+    return res.status(400).json({ success: false, message: 'Enter a valid listing price greater than zero.' });
+  }
+  const rentPeriod = body.rent_period ?? existing.rent_period ?? 'MONTH';
+  if (!['DAY', 'NIGHT', 'MONTH', 'YEAR'].includes(rentPeriod)) {
+    return res.status(400).json({ success: false, message: 'Select a valid rent period.' });
+  }
+  const approvalStatus = body.approval_status ?? existing.approval_status;
+  if (!['PENDING_APPROVAL', 'APPROVED', 'REJECTED'].includes(approvalStatus)) {
+    return res.status(400).json({ success: false, message: 'Select a valid approval status.' });
+  }
+  const availabilityStatus = body.availability_status ?? existing.availability_status;
+  if (!['AVAILABLE', 'OCCUPIED', 'PAUSED', 'EXPIRED', 'PENDING_APPROVAL'].includes(availabilityStatus)) {
+    return res.status(400).json({ success: false, message: 'Select a valid availability status.' });
+  }
+
+  const images = body.images !== undefined ? body.images : JSON.parse(existing.images_json || '[]');
+  if (!Array.isArray(images) || images.length > 4
+    || images.some((image) => typeof image !== 'string' || !image.trim())) {
+    return res.status(400).json({ success: false, message: 'A listing can have no more than 4 valid photos.' });
+  }
+  const amenities = body.amenities !== undefined ? body.amenities : JSON.parse(existing.amenities_json || '[]');
+  if (!Array.isArray(amenities) || amenities.some((item) => typeof item !== 'string')) {
+    return res.status(400).json({ success: false, message: 'Amenities must be a list of text values.' });
+  }
+
+  const numericFields = ['deposit', 'bedrooms', 'bathrooms'];
+  const numbers = Object.fromEntries(numericFields.map((field) => [
+    field,
+    Number(body[field] ?? existing[field]),
+  ]));
+  if (Object.values(numbers).some((value) => !Number.isFinite(value) || value < 0)) {
+    return res.status(400).json({ success: false, message: 'Deposit, bedrooms, and bathrooms must be non-negative numbers.' });
+  }
+  const pinValue = (field) => {
+    const raw = body[field] ?? existing[field];
+    if (raw === '' || raw === null || raw === undefined) return null;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : NaN;
+  };
+  const pinLat = pinValue('pin_lat');
+  const pinLng = pinValue('pin_lng');
+  if (Number.isNaN(pinLat) || Number.isNaN(pinLng)) {
+    return res.status(400).json({ success: false, message: 'Location coordinates must be valid numbers.' });
+  }
+
+  await db.execute({
+    sql: `UPDATE properties SET
+      title = ?, owner_name = ?, property_type = ?, property_types_json = ?,
+      description = ?, target_tenants_desc = ?, min_rent = ?, max_rent = ?, monthly_rent = ?, rent_period = ?,
+      deposit = ?, county = ?, town = ?, estate = ?, pin_lat = ?, pin_lng = ?, pin_label = ?,
+      bedrooms = ?, bathrooms = ?, furnished_status = ?, amenities_json = ?, images_json = ?,
+      contact_phone = ?, contact_whatsapp = ?, approval_status = ?, availability_status = ?
+      WHERE id = ?`,
+    args: [
+      title,
+      String(body.owner_name ?? existing.owner_name).trim(),
+      propertyTypes[0],
+      JSON.stringify(propertyTypes),
+      String(body.description ?? existing.description).trim(),
+      String(body.target_tenants_desc ?? existing.target_tenants_desc).trim(),
+      rentAmount, rentAmount, rentAmount, rentPeriod,
+      numbers.deposit,
+      String(body.county ?? existing.county).trim(),
+      String(body.town ?? existing.town).trim(),
+      String(body.estate ?? existing.estate).trim(),
+      pinLat,
+      pinLng,
+      String(body.pin_label ?? existing.pin_label).trim(),
+      numbers.bedrooms,
+      numbers.bathrooms,
+      String(body.furnished_status ?? existing.furnished_status),
+      JSON.stringify(amenities),
+      JSON.stringify(images),
+      String(body.contact_phone ?? existing.contact_phone).trim(),
+      String(body.contact_whatsapp ?? existing.contact_whatsapp).trim(),
+      approvalStatus,
+      availabilityStatus,
+      req.params.id,
+    ],
+  });
+  return res.json({ success: true, message: 'Listing updated.' });
+});
+
 app.patch('/api/admin/properties/:id/extend', requireAdmin, async (req, res) => {
   const days = Number(req.body?.days);
   if (!Number.isInteger(days) || days < 1 || days > 3650) {
@@ -1297,6 +1408,46 @@ app.patch('/api/admin/properties/:id/extend', requireAdmin, async (req, res) => 
     args: [expiresAt, req.params.id],
   });
   return res.json({ success: true, message: `Listing extended by ${days} days.` });
+});
+
+app.patch('/api/admin/properties/:id/gift', requireAdmin, async (req, res) => {
+  const days = Number(req.body?.days);
+  if (!Number.isInteger(days) || days < 1 || days > 3650) {
+    return res.status(400).json({ success: false, message: 'Enter a whole number of gifted days between 1 and 3650.' });
+  }
+  const property = (await db.execute({
+    sql: 'SELECT expires_at FROM properties WHERE id = ?',
+    args: [req.params.id],
+  })).rows[0];
+  if (!property) return res.status(404).json({ success: false, message: 'Listing not found.' });
+  const base = Math.max(Date.now(), new Date(property.expires_at).getTime());
+  const expiresAt = new Date(base + days * 86400000).toISOString();
+  await db.execute({
+    sql: `UPDATE properties SET expires_at = ?,
+      availability_status = CASE WHEN approval_status = 'APPROVED' AND availability_status = 'EXPIRED' THEN 'AVAILABLE' ELSE availability_status END
+      WHERE id = ?`,
+    args: [expiresAt, req.params.id],
+  });
+  return res.json({ success: true, message: `Gifted ${days} additional listing days. New expiry: ${expiresAt}.` });
+});
+
+app.patch('/api/admin/properties/:id/priority', requireAdmin, async (req, res) => {
+  const days = Number(req.body?.days);
+  if (!Number.isInteger(days) || days < 1 || days > 36500) {
+    return res.status(400).json({ success: false, message: 'Enter a whole number of priority days between 1 and 36500.' });
+  }
+  const property = (await db.execute({
+    sql: 'SELECT priority_expires_at FROM properties WHERE id = ?',
+    args: [req.params.id],
+  })).rows[0];
+  if (!property) return res.status(404).json({ success: false, message: 'Listing not found.' });
+  const existingExpiry = property.priority_expires_at ? new Date(property.priority_expires_at).getTime() : 0;
+  const expiresAt = new Date(Math.max(Date.now(), existingExpiry) + days * 86400000).toISOString();
+  await db.execute({
+    sql: `UPDATE properties SET priority_score = 100, priority_label = 'Admin Priority', priority_expires_at = ? WHERE id = ?`,
+    args: [expiresAt, req.params.id],
+  });
+  return res.json({ success: true, message: `Listing prioritized for ${days} days, until ${expiresAt}.` });
 });
 
 app.delete('/api/admin/properties/:id', requireAdmin, async (req, res) => {
@@ -1441,6 +1592,27 @@ app.patch('/api/admin/users/:id/suspend', requireAdmin, async (req, res) => {
     args: [isSuspended ? 1 : 0, req.params.id],
   });
   return res.json({ success: true, message: 'User status updated' });
+});
+
+app.post('/api/admin/users/:id/gift-post', requireAdmin, async (req, res) => {
+  const days = Number(req.body?.days);
+  if (!Number.isInteger(days) || days < 1 || days > 3650) {
+    return res.status(400).json({ success: false, message: 'Enter a whole number of gifted post days between 1 and 3650.' });
+  }
+  const userExists = (await db.execute({
+    sql: 'SELECT id FROM users WHERE id = ?',
+    args: [req.params.id],
+  })).rows[0];
+  if (!userExists) return res.status(404).json({ success: false, message: 'User not found.' });
+
+  const startsAt = new Date();
+  const expiresAt = new Date(startsAt.getTime() + days * 86400000);
+  await db.execute({
+    sql: `INSERT INTO subscriptions (id, user_id, plan_id, source_type, posts_total, posts_used, starts_at, expires_at, status)
+          VALUES (?, ?, NULL, 'FREE_FIRST_POST', 1, 0, ?, ?, 'ACTIVE')`,
+    args: [crypto.randomUUID(), req.params.id, startsAt.toISOString(), expiresAt.toISOString()],
+  });
+  return res.json({ success: true, message: `Gifted one post to the user. It can be used until ${expiresAt.toISOString()}.` });
 });
 
 app.use((req, res) => {
