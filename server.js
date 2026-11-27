@@ -1,3 +1,4 @@
+
 import dotenv from 'dotenv';
 dotenv.config();
 import express from 'express';
@@ -37,6 +38,7 @@ const PROPERTY_TYPES = [
   'Lodging',
   'Cottage',
   'Restaurant',
+  'Students Hostel',
 ];
 const DEFAULT_CONTACT_UNLOCK_PRICES = Object.fromEntries(PROPERTY_TYPES.map((type) => [type, 10]));
 
@@ -47,7 +49,7 @@ const db = createClient({
 
 app.use(helmet());
 const allowedOrigins = [
-  'https://house.stackcrafts.com',
+  'https://house.stackcrafta.com',
   'https://rent.stackcrafts.com',
   'https://main.xyz',
 ];
@@ -97,9 +99,9 @@ app.get('/api/health', async (req, res) => {
   return res.json({ success: true, database: 'connected' });
 });
 
-app.get('/api', (req, res) => res.json({ success: true, name: 'KejaSasa API', health: '/api/health' }));
+app.get('/api', (req, res) => res.json({ success: true, name: 'Lodora Houses and Homes API', health: '/api/health' }));
 app.get(['/', '/index.html', '/admin', '/admin.html'], (req, res) => {
-  return res.json({ success: true, name: 'KejaSasa API', health: '/api/health' });
+  return res.json({ success: true, name: 'Lodora Houses and Homes API', health: '/api/health' });
 });
 
 function hashPassword(password) {
@@ -250,6 +252,7 @@ async function initDb() {
       availability_status TEXT NOT NULL DEFAULT 'PENDING_APPROVAL' CHECK (availability_status IN ('AVAILABLE', 'OCCUPIED', 'PAUSED', 'EXPIRED', 'PENDING_APPROVAL')),
       priority_score INTEGER NOT NULL DEFAULT 1,
       priority_label TEXT NOT NULL DEFAULT 'Normal',
+      priority_plan_price REAL NOT NULL DEFAULT 0,
       priority_expires_at TEXT,
       expires_at TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -294,6 +297,28 @@ async function initDb() {
       message TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`,
+    `CREATE TABLE IF NOT EXISTS guest_contact_payments (
+      id TEXT PRIMARY KEY,
+      property_id TEXT NOT NULL,
+      property_title TEXT NOT NULL,
+      amount REAL NOT NULL,
+      phone_number TEXT NOT NULL,
+      reason TEXT NOT NULL DEFAULT 'CONTACT_AND_LOCATION_UNLOCK',
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      result_code INTEGER,
+      result_desc TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
+    `CREATE TABLE IF NOT EXISTS property_activity_notifications (
+      id TEXT PRIMARY KEY,
+      property_id TEXT NOT NULL,
+      activity_type TEXT NOT NULL CHECK (activity_type IN ('CALL', 'WHATSAPP', 'LOCATION_PIN', 'CONTACT_UNLOCK')),
+      property_title TEXT NOT NULL,
+      owner_name TEXT NOT NULL,
+      visitor_name TEXT NOT NULL DEFAULT 'Visitor',
+      visitor_phone TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
   ], 'write');
 
   const usersColumns = (await db.execute('PRAGMA table_info(users)')).rows.map((column) => column.name);
@@ -319,6 +344,9 @@ async function initDb() {
   }
   if (!propertyColumns.includes('contact_hidden')) {
     await db.execute('ALTER TABLE properties ADD COLUMN contact_hidden INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!propertyColumns.includes('priority_plan_price')) {
+    await db.execute('ALTER TABLE properties ADD COLUMN priority_plan_price REAL NOT NULL DEFAULT 0');
   }
   const paymentTable = (await db.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'payments'")).rows[0];
   if (paymentTable && !String(paymentTable.sql || '').includes('CONTACT_UNLOCK')) {
@@ -366,6 +394,24 @@ async function initDb() {
     SET phone = COALESCE(NULLIF(phone, ''), NULLIF(call_phone, ''), whatsapp_phone)
     WHERE phone IS NULL OR phone = ''
   `);
+  const config = await getConfig();
+  let contactPrices = {};
+  try {
+    contactPrices = JSON.parse(config.contact_unlock_prices || '{}');
+  } catch {
+    console.error('Stored contact unlock prices are invalid JSON; preserving them for admin review.');
+  }
+  if (contactPrices && typeof contactPrices === 'object' && !Array.isArray(contactPrices)) {
+    const migratedPrices = Object.fromEntries(PROPERTY_TYPES.map((type) => [
+      type,
+      Number(contactPrices[type]) > 0 ? Number(contactPrices[type]) : 10,
+    ]));
+    await db.execute({
+      sql: `INSERT INTO system_config (key, value) VALUES ('contact_unlock_prices', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      args: [JSON.stringify(migratedPrices)],
+    });
+  }
 }
 
 function slugify(str) {
@@ -502,6 +548,28 @@ async function requireAuth(req, res, next) {
   }
 }
 
+async function optionalAuth(req, res, next) {
+  const token = readBearerToken(req);
+  if (!token) return next();
+  try {
+    const claims = jwt.verify(token, JWT_SECRET, {
+      issuer: 'nyumba-api',
+      audience: 'nyumba-web',
+    });
+    if (typeof claims === 'string' || !claims.sub) return next();
+    const user = (await db.execute({
+      sql: 'SELECT * FROM users WHERE id = ?',
+      args: [claims.sub],
+    })).rows[0];
+    if (user && !user.is_suspended) req.user = user;
+    return next();
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return next();
+    console.error('Optional account lookup failed:', error.message);
+    return res.status(500).json({ success: false, message: 'Could not verify account session.' });
+  }
+}
+
 async function requireAdmin(req, res, next) {
   try {
     const claims = jwt.verify(readBearerToken(req), JWT_SECRET, {
@@ -545,7 +613,7 @@ async function sendResetCodeEmail(toEmail, toName, code) {
   if (missingConfiguration.length) {
     throw new Error(`Password reset email is not configured on this API host. Missing: ${missingConfiguration.join(', ')}.`);
   }
-  const resetMessage = `Hello ${toName || 'there'}, your KejaSasa password reset verification code is ${code}. Enter this code in the password reset form within 15 minutes. If you did not request this, you can ignore this email.`;
+  const resetMessage = `Hello ${toName || 'there'}, your Lodora Houses and Homes password reset verification code is ${code}. Enter this code in the password reset form within 15 minutes. If you did not request this, you can ignore this email.`;
   const resp = await fetchUpstream('https://api.emailjs.com/api/v1.0/email/send', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -555,7 +623,7 @@ async function sendResetCodeEmail(toEmail, toName, code) {
       user_id: EMAILJS_PUBLIC_KEY,
       accessToken: EMAILJS_PRIVATE_KEY,
       template_params: {
-        subject: 'KejaSasa password reset verification code',
+        subject: 'Lodora Houses and Homes password reset verification code',
         message: resetMessage,
         content: resetMessage,
         to_email: toEmail,
@@ -735,7 +803,7 @@ app.post('/api/auth/forgot-password/request', async (req, res) => {
     });
 
     try {
-      await sendResetCodeEmail(user.email, user.full_name, code);
+      await sendResetCodeEmail(cleanEmail, user.full_name, code);
     } catch (emailError) {
       try {
         await db.execute({
@@ -880,28 +948,41 @@ app.put('/api/user/contact-profile', requireAuth, async (req, res) => {
 });
 
 // PUBLIC HOUSE LISTINGS
-app.get('/api/properties/:id', async (req, res) => {
+app.get('/api/properties/:id', optionalAuth, async (req, res) => {
   try {
     const now = new Date().toISOString();
     const config = await getConfig();
     const property = (await db.execute({
       sql: `SELECT id, title, property_type, property_types_json, type_pricing_json, owner_name, estate, town, county, min_rent, max_rent,
                    rent_period, availability_status,
-                   CASE WHEN expires_at > ? AND contact_hidden = 0 THEN contact_phone ELSE NULL END AS contact_phone,
-                   CASE WHEN expires_at > ? AND contact_hidden = 0 THEN contact_whatsapp ELSE NULL END AS contact_whatsapp,
+                   contact_phone, contact_whatsapp,
                    expires_at, contact_hidden, pin_lat, pin_lng, pin_label, description, target_tenants_desc, images_json
             FROM properties
             WHERE id = ? AND approval_status = 'APPROVED'
               AND availability_status IN ('AVAILABLE', 'OCCUPIED')`,
-      args: [now, now, req.params.id],
+      args: [req.params.id],
     })).rows[0];
     if (!property) return res.status(404).json({ success: false, message: 'This listing is no longer available.' });
     const isLocked = Boolean(property.contact_hidden) || property.expires_at <= now;
+    const accountUnlock = req.user ? (await db.execute({
+      sql: 'SELECT 1 FROM property_contact_unlocks WHERE user_id = ? AND property_id = ?',
+      args: [req.user.id, property.id],
+    })).rows[0] : null;
+    const guestUnlock = req.query.unlock_token ? (await db.execute({
+      sql: `SELECT 1 FROM guest_contact_payments
+            WHERE id = ? AND property_id = ? AND status = 'SUCCESSFUL'`,
+      args: [String(req.query.unlock_token), property.id],
+    })).rows[0] : null;
+    const contactUnlocked = !isLocked || Boolean(accountUnlock || guestUnlock);
     return res.json({
       success: true,
       data: {
         ...property,
-        contact_locked: isLocked,
+        contact_phone: contactUnlocked ? property.contact_phone : null,
+        contact_whatsapp: contactUnlocked ? property.contact_whatsapp : null,
+        pin_lat: contactUnlocked ? property.pin_lat : null,
+        pin_lng: contactUnlocked ? property.pin_lng : null,
+        contact_locked: isLocked && !contactUnlocked,
         contact_unlock_price: contactUnlockPrice(property, config),
       },
     });
@@ -939,21 +1020,27 @@ app.get('/api/properties', async (req, res) => {
       args.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
     }
 
+    const priorityOrder = `CASE WHEN priority_expires_at > '${now}' THEN 1 ELSE 0 END DESC,
+      priority_plan_price DESC,
+      CASE WHEN priority_expires_at > '${now}' THEN priority_score ELSE 1 END DESC`;
     const orderBy =
-      sort === 'lowest_price' ? 'min_rent ASC' :
-      sort === 'highest_price' ? 'max_rent DESC' :
-      sort === 'newest' ? 'created_at DESC' :
-      `CASE WHEN priority_expires_at > '${now}' THEN priority_score ELSE 1 END DESC, created_at DESC`;
+      sort === 'lowest_price' ? `${priorityOrder}, min_rent ASC` :
+      sort === 'highest_price' ? `${priorityOrder}, max_rent DESC` :
+      sort === 'newest' ? `${priorityOrder}, created_at DESC` :
+      `${priorityOrder}, created_at DESC`;
 
     const rows = await db.execute({
       sql: `SELECT id, title, property_type, property_types_json, type_pricing_json, owner_name, estate, town, county, min_rent, max_rent,
                    rent_period, availability_status,
                    CASE WHEN expires_at > ? AND contact_hidden = 0 THEN contact_phone ELSE NULL END AS contact_phone,
                    CASE WHEN expires_at > ? AND contact_hidden = 0 THEN contact_whatsapp ELSE NULL END AS contact_whatsapp,
-                   expires_at, contact_hidden, pin_lat, pin_lng, pin_label,
+                   expires_at, contact_hidden, priority_score, priority_label, priority_expires_at,
+                   CASE WHEN expires_at > ? AND contact_hidden = 0 THEN pin_lat ELSE NULL END AS pin_lat,
+                   CASE WHEN expires_at > ? AND contact_hidden = 0 THEN pin_lng ELSE NULL END AS pin_lng,
+                   pin_label,
                    json_extract(images_json, '$[0]') AS cover_image
             FROM properties WHERE ${conds.join(' AND ')} ORDER BY ${orderBy} LIMIT 80`,
-      args: [now, now, ...args],
+      args: [now, now, now, now, ...args],
     });
     const config = await getConfig();
     return res.json({
@@ -969,7 +1056,7 @@ app.get('/api/properties', async (req, res) => {
   }
 });
 
-app.get('/api/properties/:id/contact', requireAuth, async (req, res) => {
+app.get('/api/properties/:id/contact', optionalAuth, async (req, res) => {
   try {
     const property = (await db.execute({
       sql: `SELECT id, property_type, property_types_json, contact_phone, contact_whatsapp,
@@ -981,12 +1068,17 @@ app.get('/api/properties/:id/contact', requireAuth, async (req, res) => {
     })).rows[0];
     if (!property) return res.status(404).json({ success: false, message: 'This listing is no longer available.' });
 
-    const unlock = (await db.execute({
+    const unlock = req.user ? (await db.execute({
       sql: 'SELECT 1 FROM property_contact_unlocks WHERE user_id = ? AND property_id = ?',
       args: [req.user.id, property.id],
-    })).rows[0];
+    })).rows[0] : null;
     const isLocked = Boolean(property.contact_hidden) || property.expires_at <= new Date().toISOString();
-    if (isLocked && !unlock) {
+    const guestPayment = req.query.unlock_token ? (await db.execute({
+      sql: `SELECT 1 FROM guest_contact_payments
+            WHERE id = ? AND property_id = ? AND status = 'SUCCESSFUL'`,
+      args: [String(req.query.unlock_token), property.id],
+    })).rows[0] : null;
+    if (isLocked && !unlock && !guestPayment) {
       return res.status(402).json({
         success: false,
         code: 'CONTACT_LOCKED',
@@ -995,7 +1087,7 @@ app.get('/api/properties/:id/contact', requireAuth, async (req, res) => {
           JSON.parse(property.property_types_json || '[]'),
           property.property_type,
         )[0] || property.property_type,
-        message: 'A small payment to KejaSasa is required to unlock this contact. It goes to the system, not the landlord or house owner.',
+        message: 'A small payment is required to unlock the contact and exact location. It goes to the system, not the landlord or house owner.',
       });
     }
 
@@ -1304,6 +1396,116 @@ app.get('/api/plans', async (req, res) => {
   return res.json({ success: true, data: { plans: [], priorityPlans, config } });
 });
 
+app.post('/api/guest/contact-payments', async (req, res) => {
+  let paymentId = null;
+  try {
+    const propertyId = String(req.body?.property_id || '');
+    const phone = normalizePhone(req.body?.phone_number);
+    if (!/^(?:254)?[17]\d{8}$/.test(phone)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid Kenyan mobile number for the payment prompt.' });
+    }
+    const property = (await db.execute({
+      sql: `SELECT id, title, property_type, property_types_json, contact_hidden, expires_at
+            FROM properties WHERE id = ? AND approval_status = 'APPROVED'
+              AND availability_status IN ('AVAILABLE', 'OCCUPIED')`,
+      args: [propertyId],
+    })).rows[0];
+    if (!property) return res.status(404).json({ success: false, message: 'Listing not found.' });
+    if (!property.contact_hidden && property.expires_at > new Date().toISOString()) {
+      return res.status(409).json({ success: false, message: 'This listing contact and location are currently free to view.' });
+    }
+    const amount = contactUnlockPrice(property, await getConfig());
+    paymentId = crypto.randomUUID();
+    await db.execute({
+      sql: `INSERT INTO guest_contact_payments (id, property_id, property_title, amount, phone_number, reason)
+            VALUES (?, ?, ?, ?, ?, 'CONTACT_AND_LOCATION_UNLOCK')`,
+      args: [paymentId, property.id, property.title, amount, phone],
+    });
+    const { response, data } = await fetchUpstreamJson(`${PAYMENT_GATEWAY_URL}/api/stk-push`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+      body: JSON.stringify({ amount, phone_number: phone }),
+    });
+    if (!response.ok || !data.success) {
+      await db.execute({
+        sql: `UPDATE guest_contact_payments SET status = 'FAILED', result_desc = ? WHERE id = ?`,
+        args: [String(data.message || 'The payment provider rejected the payment prompt.').slice(0, 500), paymentId],
+      });
+      return res.status(502).json({ success: false, message: data.message || 'The payment provider rejected the payment prompt.' });
+    }
+    return res.json({ success: true, message: 'Payment prompt sent.', data: { payment_id: paymentId, amount } });
+  } catch (error) {
+    if (paymentId) {
+      await db.execute({
+        sql: `UPDATE guest_contact_payments SET status = 'FAILED', result_desc = ? WHERE id = ? AND status = 'PENDING'`,
+        args: [String(error.message || 'Payment provider unavailable').slice(0, 500), paymentId],
+      }).catch((databaseError) => console.error('Could not mark guest payment failed:', databaseError.message));
+    }
+    return res.status(error.status || 500).json({ success: false, message: error.message || 'Could not start payment.' });
+  }
+});
+
+app.get('/api/guest/contact-payments/:id/verify', async (req, res) => {
+  try {
+    const payment = (await db.execute({
+      sql: 'SELECT * FROM guest_contact_payments WHERE id = ?',
+      args: [req.params.id],
+    })).rows[0];
+    if (!payment) return res.status(404).json({ success: false, message: 'Payment not found.' });
+    if (payment.status === 'SUCCESSFUL') {
+      return res.json({ success: true, data: { status: 'SUCCESSFUL', resultCode: 0 } });
+    }
+    const { data } = await fetchUpstreamJson(`${PAYMENT_GATEWAY_URL}/api/status`, {
+      headers: { 'ngrok-skip-browser-warning': 'true' },
+    });
+    if (data.status !== true || !data.response) {
+      return res.json({ success: true, data: { status: 'PENDING' } });
+    }
+    const resultCode = Number(data.response.ResultCode);
+    const resultDesc = String(data.response.ResultDesc || '');
+    if (resultCode === 0) {
+      await db.execute({
+        sql: `UPDATE guest_contact_payments SET status = 'SUCCESSFUL', result_code = ?, result_desc = ? WHERE id = ? AND status = 'PENDING'`,
+        args: [resultCode, resultDesc, payment.id],
+      });
+      return res.json({ success: true, data: { status: 'SUCCESSFUL', resultCode } });
+    }
+    const status = resultCode === 1032 ? 'CANCELLED' : 'FAILED';
+    await db.execute({
+      sql: 'UPDATE guest_contact_payments SET status = ?, result_code = ?, result_desc = ? WHERE id = ?',
+      args: [status, resultCode, resultDesc, payment.id],
+    });
+    return res.json({ success: false, message: resultDesc, data: { status, resultCode } });
+  } catch (error) {
+    return res.status(error.status || 500).json({ success: false, message: error.message || 'Payment verification error.' });
+  }
+});
+
+app.post('/api/properties/:id/activity', optionalAuth, async (req, res) => {
+  const activityType = String(req.body?.activity_type || '').toUpperCase();
+  if (!['CALL', 'WHATSAPP', 'LOCATION_PIN', 'CONTACT_UNLOCK'].includes(activityType)) {
+    return res.status(400).json({ success: false, message: 'Select a valid listing activity.' });
+  }
+  const property = (await db.execute({
+    sql: `SELECT id, title, owner_name FROM properties
+          WHERE id = ? AND approval_status = 'APPROVED'
+            AND availability_status IN ('AVAILABLE', 'OCCUPIED')`,
+    args: [req.params.id],
+  })).rows[0];
+  if (!property) return res.status(404).json({ success: false, message: 'Listing not found.' });
+  await db.execute({
+    sql: `INSERT INTO property_activity_notifications
+          (id, property_id, activity_type, property_title, owner_name, visitor_name, visitor_phone)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      crypto.randomUUID(), property.id, activityType, property.title, property.owner_name,
+      String(req.user?.full_name || 'Visitor').slice(0, 120),
+      String(req.user?.call_phone || req.user?.phone || '').slice(0, 32),
+    ],
+  });
+  return res.status(201).json({ success: true });
+});
+
 app.post('/api/payments/initiate', requireAuth, async (req, res) => {
   let paymentId = null;
   try {
@@ -1452,8 +1654,8 @@ app.get('/api/payments/:id/verify', requireAuth, async (req, res) => {
           }
           expiresAt = new Date(now.getTime() + Number(pPlan.duration_days) * 86400000).toISOString();
           statements.push({
-            sql: `UPDATE properties SET priority_score = ?, priority_label = ?, priority_expires_at = ? WHERE id = ? AND owner_id = ?`,
-            args: [Number(pPlan.priority_level), pPlan.name, expiresAt, payment.property_id, payment.user_id],
+            sql: `UPDATE properties SET priority_score = ?, priority_label = ?, priority_plan_price = ?, priority_expires_at = ? WHERE id = ? AND owner_id = ?`,
+            args: [Number(pPlan.priority_level), pPlan.name, Number(pPlan.price), expiresAt, payment.property_id, payment.user_id],
           });
         } else if (payment.purpose === 'ADD_PHOTO' && payment.property_id && payment.pending_photo_data) {
           const prop = (await db.execute({ sql: 'SELECT * FROM properties WHERE id = ? AND owner_id = ?', args: [payment.property_id, payment.user_id] })).rows[0];
@@ -1508,7 +1710,26 @@ app.get('/api/admin/overview', requireAdmin, async (req, res) => {
   const plans = (await db.execute('SELECT * FROM plans ORDER BY created_at DESC')).rows;
   const priorityPlans = (await db.execute('SELECT * FROM priority_plans ORDER BY created_at DESC')).rows;
   const users = (await db.execute('SELECT id, full_name, email, phone, role, call_phone, whatsapp_phone, is_suspended, created_at FROM users ORDER BY created_at DESC')).rows;
-  const payments = (await db.execute('SELECT * FROM payments ORDER BY created_at DESC')).rows;
+  const accountPayments = (await db.execute(`
+    SELECT p.*, u.full_name AS account_name, p.purpose AS payment_reason,
+           property.title AS property_title
+    FROM payments p
+    LEFT JOIN users u ON u.id = p.user_id
+    LEFT JOIN properties property ON property.id = p.property_id
+    ORDER BY p.created_at DESC
+  `)).rows;
+  const guestPayments = (await db.execute(`
+    SELECT guest.id, NULL AS user_id, 'CONTACT_UNLOCK' AS purpose, NULL AS plan_id,
+           NULL AS priority_plan_id, guest.property_id, NULL AS pending_photo_data,
+           guest.amount, 'KES' AS currency, guest.phone_number, guest.status,
+           guest.result_code, guest.result_desc, NULL AS expires_at, guest.created_at,
+           'Visitor (no account)' AS account_name,
+           guest.reason AS payment_reason, guest.property_title
+    FROM guest_contact_payments guest
+    ORDER BY guest.created_at DESC
+  `)).rows;
+  const payments = [...accountPayments, ...guestPayments]
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   const reports = (await db.execute(`
     SELECT r.*, p.title AS property_title, p.availability_status AS property_status
     FROM property_reports r
@@ -1516,6 +1737,9 @@ app.get('/api/admin/overview', requireAdmin, async (req, res) => {
     ORDER BY r.created_at DESC
   `)).rows;
   const alerts = (await db.execute('SELECT * FROM admin_alerts ORDER BY created_at DESC')).rows;
+  const activityNotifications = (await db.execute(`
+    SELECT * FROM property_activity_notifications ORDER BY created_at DESC LIMIT 1000
+  `)).rows;
   const config = await getConfig();
 
   const stats = {
@@ -1527,7 +1751,7 @@ app.get('/api/admin/overview', requireAdmin, async (req, res) => {
     openReports: reports.filter((r) => r.status === 'OPEN').length,
   };
 
-  return res.json({ success: true, data: { stats, properties, plans, priorityPlans, users, payments, reports, alerts, config } });
+  return res.json({ success: true, data: { stats, properties, plans, priorityPlans, users, payments, reports, alerts, activityNotifications, config } });
 });
 
 app.patch('/api/admin/properties/:id/approve', requireAdmin, async (req, res) => {
@@ -1735,7 +1959,13 @@ app.patch('/api/admin/properties/:id/gift', requireAdmin, async (req, res) => {
 });
 
 app.patch('/api/admin/properties/:id/priority', requireAdmin, async (req, res) => {
-  const days = Number(req.body?.days);
+  const planId = String(req.body?.priority_plan_id || '');
+  const plan = planId ? (await db.execute({
+    sql: 'SELECT * FROM priority_plans WHERE id = ? AND is_active = 1',
+    args: [planId],
+  })).rows[0] : null;
+  if (planId && !plan) return res.status(404).json({ success: false, message: 'Select an active priority plan.' });
+  const days = Number(plan?.duration_days ?? req.body?.days);
   if (!Number.isInteger(days) || days < 1 || days > 36500) {
     return res.status(400).json({ success: false, message: 'Enter a whole number of priority days between 1 and 36500.' });
   }
@@ -1747,10 +1977,10 @@ app.patch('/api/admin/properties/:id/priority', requireAdmin, async (req, res) =
   const existingExpiry = property.priority_expires_at ? new Date(property.priority_expires_at).getTime() : 0;
   const expiresAt = new Date(Math.max(Date.now(), existingExpiry) + days * 86400000).toISOString();
   await db.execute({
-    sql: `UPDATE properties SET priority_score = 100, priority_label = 'Admin Priority', priority_expires_at = ? WHERE id = ?`,
-    args: [expiresAt, req.params.id],
+    sql: `UPDATE properties SET priority_score = ?, priority_label = ?, priority_plan_price = ?, priority_expires_at = ? WHERE id = ?`,
+    args: [plan ? Number(plan.priority_level) : 100, plan?.name || 'Admin Priority', Number(plan?.price || 0), expiresAt, req.params.id],
   });
-  return res.json({ success: true, message: `Listing prioritized for ${days} days, until ${expiresAt}.` });
+  return res.json({ success: true, message: `${plan?.name || 'Admin priority'} applied for ${days} days, until ${expiresAt}.` });
 });
 
 app.delete('/api/admin/properties/:id', requireAdmin, async (req, res) => {
@@ -1964,7 +2194,7 @@ const isDirectExecution = process.argv[1]
   && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isDirectExecution) {
   initDb()
-    .then(() => app.listen(PORT, () => console.log(`KejaSasa API running on port ${PORT}`)))
+    .then(() => app.listen(PORT, () => console.log(`Lodora Houses and Homes API running on port ${PORT}`)))
     .catch((err) => {
       console.error('Database initialization failed:', err.message);
       process.exit(1);
