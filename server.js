@@ -207,6 +207,7 @@ async function initDb() {
       posts_used INTEGER NOT NULL DEFAULT 0,
       starts_at TEXT NOT NULL,
       expires_at TEXT NOT NULL,
+      source_label TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT 'ACTIVE',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`,
@@ -225,6 +226,7 @@ async function initDb() {
       max_rent REAL NOT NULL DEFAULT 0,
       monthly_rent REAL NOT NULL DEFAULT 0,
       rent_period TEXT NOT NULL DEFAULT 'MONTH' CHECK (rent_period IN ('DAY', 'NIGHT', 'MONTH', 'YEAR')),
+      type_pricing_json TEXT NOT NULL DEFAULT '{}',
       deposit REAL NOT NULL DEFAULT 0,
       county TEXT NOT NULL DEFAULT '',
       town TEXT NOT NULL DEFAULT '',
@@ -290,11 +292,18 @@ async function initDb() {
     await db.execute('ALTER TABLE users ADD COLUMN password_hash TEXT');
   }
   const propertyColumns = (await db.execute('PRAGMA table_info(properties)')).rows.map((column) => column.name);
+  const subscriptionColumns = (await db.execute('PRAGMA table_info(subscriptions)')).rows.map((column) => column.name);
+  if (!subscriptionColumns.includes('source_label')) {
+    await db.execute("ALTER TABLE subscriptions ADD COLUMN source_label TEXT NOT NULL DEFAULT ''");
+  }
   if (!propertyColumns.includes('rent_period')) {
     await db.execute("ALTER TABLE properties ADD COLUMN rent_period TEXT NOT NULL DEFAULT 'MONTH'");
   }
   if (!propertyColumns.includes('property_types_json')) {
     await db.execute("ALTER TABLE properties ADD COLUMN property_types_json TEXT NOT NULL DEFAULT '[]'");
+  }
+  if (!propertyColumns.includes('type_pricing_json')) {
+    await db.execute("ALTER TABLE properties ADD COLUMN type_pricing_json TEXT NOT NULL DEFAULT '{}'");
   }
   await db.execute(`
     UPDATE properties
@@ -317,6 +326,39 @@ function normalizePropertyTypes(input, fallbackType = '') {
   return [...new Set(requested
     .map((type) => String(type || '').trim())
     .filter((type) => PROPERTY_TYPES.includes(type)))];
+}
+
+function normalizeRentPricing(input, propertyTypes, fallback = {}) {
+  if (input !== undefined && (!input || typeof input !== 'object' || Array.isArray(input))) {
+    return { error: 'Enter rent details for every selected property type.' };
+  }
+
+  const pricing = {};
+  const prices = [];
+  for (const type of propertyTypes) {
+    const entry = input?.[type] || {};
+    const price = Number(entry.price ?? entry.rent_amount ?? fallback.price);
+    const rentPeriod = entry.rent_period ?? entry.period ?? fallback.rent_period ?? 'MONTH';
+    const rentPeriodDays = rentPeriod === 'DAY' ? Number(entry.rent_period_days ?? entry.period_days ?? 1) : 1;
+    if (!Number.isFinite(price) || price <= 0) {
+      return { error: `Enter a valid price for ${type}.` };
+    }
+    if (!['DAY', 'NIGHT', 'MONTH', 'YEAR'].includes(rentPeriod)) {
+      return { error: `Select a valid rent period for ${type}.` };
+    }
+    if (!Number.isInteger(rentPeriodDays) || rentPeriodDays < 1 || rentPeriodDays > 365) {
+      return { error: `The number of days for ${type} must be between 1 and 365.` };
+    }
+    pricing[type] = { price, rent_period: rentPeriod, rent_period_days: rentPeriodDays };
+    prices.push(price);
+  }
+
+  return {
+    pricing,
+    minRent: Math.min(...prices),
+    maxRent: Math.max(...prices),
+    first: pricing[propertyTypes[0]],
+  };
 }
 
 function addPlanDuration(startAt, durationDays) {
@@ -766,7 +808,7 @@ app.get('/api/properties/:id', async (req, res) => {
   try {
     const now = new Date().toISOString();
     const property = (await db.execute({
-      sql: `SELECT id, title, property_type, property_types_json, owner_name, estate, town, county, min_rent, max_rent,
+      sql: `SELECT id, title, property_type, property_types_json, type_pricing_json, owner_name, estate, town, county, min_rent, max_rent,
                    rent_period, availability_status, contact_phone, contact_whatsapp, pin_lat, pin_lng,
                    pin_label, description, target_tenants_desc, images_json
             FROM properties
@@ -817,7 +859,7 @@ app.get('/api/properties', async (req, res) => {
       `CASE WHEN priority_expires_at > '${now}' THEN priority_score ELSE 1 END DESC, created_at DESC`;
 
     const rows = await db.execute({
-      sql: `SELECT id, title, property_type, property_types_json, owner_name, estate, town, county, min_rent, max_rent,
+      sql: `SELECT id, title, property_type, property_types_json, type_pricing_json, owner_name, estate, town, county, min_rent, max_rent,
                    rent_period, availability_status, contact_phone, contact_whatsapp, pin_lat, pin_lng,
                    pin_label, json_extract(images_json, '$[0]') AS cover_image
             FROM properties WHERE ${conds.join(' AND ')} ORDER BY ${orderBy} LIMIT 80`,
@@ -846,9 +888,12 @@ app.post('/api/properties', requireAuth, async (req, res) => {
     if (!propertyTypes.length) {
       return res.status(400).json({ success: false, message: 'Select at least one valid property type in this building.' });
     }
-    const rentAmount = Number(b.rent_amount ?? b.min_rent ?? b.monthly_rent ?? 0);
-    if (!Number.isFinite(rentAmount) || rentAmount <= 0) {
-      return res.status(400).json({ success: false, message: 'Enter a valid listing price greater than zero.' });
+    const rentPricing = normalizeRentPricing(b.rent_pricing, propertyTypes, {
+      price: b.rent_amount ?? b.min_rent ?? b.monthly_rent,
+      rent_period: b.rent_period,
+    });
+    if (rentPricing.error) {
+      return res.status(400).json({ success: false, message: rentPricing.error });
     }
 
     const cfg = await getConfig();
@@ -882,9 +927,9 @@ app.post('/api/properties', requireAuth, async (req, res) => {
 
     const propertyType = propertyTypes[0];
     const title = String(b.title || '').trim() || `${propertyTypes.join(', ')} Listing`;
-    const minRent = rentAmount;
-    const maxRent = rentAmount;
-    const rentPeriod = ['DAY', 'NIGHT', 'MONTH', 'YEAR'].includes(b.rent_period) ? b.rent_period : 'MONTH';
+    const minRent = rentPricing.minRent;
+    const maxRent = rentPricing.maxRent;
+    const rentPeriod = rentPricing.first.rent_period;
     const requestedAvailability = b.availability_status === 'OCCUPIED' ? 'OCCUPIED' : 'PENDING_APPROVAL';
     const images = Array.isArray(b.images) ? b.images.slice(0, 4) : [];
     const amenities = Array.isArray(b.amenities) ? b.amenities : [];
@@ -897,16 +942,16 @@ app.post('/api/properties', requireAuth, async (req, res) => {
       sql: `INSERT INTO properties (
         id, slug, owner_id, owner_name, subscription_id, title, property_type,
         property_types_json,
-        description, target_tenants_desc, min_rent, max_rent, monthly_rent, rent_period, deposit,
+        description, target_tenants_desc, min_rent, max_rent, monthly_rent, rent_period, type_pricing_json, deposit,
         county, town, estate, pin_lat, pin_lng, pin_label,
         bedrooms, bathrooms, furnished_status, amenities_json, images_json,
         contact_phone, contact_whatsapp, approval_status, availability_status, expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?)`,
       args: [
         id, slug, req.user.id, req.user.full_name, sub.id, title, propertyType, JSON.stringify(propertyTypes),
         String(b.description || '').trim(),
         String(b.target_tenants_desc || '').trim(),
-        minRent, maxRent, minRent, rentPeriod, Number(b.deposit || 0),
+        minRent, maxRent, minRent, rentPeriod, JSON.stringify(rentPricing.pricing), Number(b.deposit || 0),
         String(b.county || '').trim(), String(b.town || '').trim(), String(b.estate || '').trim(),
         b.pin_lat !== undefined && b.pin_lat !== null && b.pin_lat !== '' ? Number(b.pin_lat) : null,
         b.pin_lng !== undefined && b.pin_lng !== null && b.pin_lng !== '' ? Number(b.pin_lng) : null,
@@ -946,12 +991,43 @@ app.put('/api/user/properties/:id', requireAuth, async (req, res) => {
     if (!propertyTypes.length) {
       return res.status(400).json({ success: false, message: 'Select at least one valid property type in this building.' });
     }
-    const rentAmount = Number(b.rent_amount ?? b.min_rent ?? existing.min_rent ?? existing.monthly_rent);
-    if (!Number.isFinite(rentAmount) || rentAmount <= 0) {
-      return res.status(400).json({ success: false, message: 'Enter a valid listing price greater than zero.' });
+    let existingPricing = {};
+    try {
+      existingPricing = JSON.parse(existing.type_pricing_json || '{}');
+    } catch {
+      existingPricing = {};
     }
-    const minRent = rentAmount;
-    const maxRent = rentAmount;
+    let rentPricing;
+    if (b.rent_pricing !== undefined) {
+      rentPricing = normalizeRentPricing(b.rent_pricing, propertyTypes);
+    } else if (Object.keys(existingPricing).length) {
+      rentPricing = normalizeRentPricing(existingPricing, propertyTypes, {
+        price: existing.min_rent ?? existing.monthly_rent,
+        rent_period: existing.rent_period,
+      });
+    } else if (b.rent_amount !== undefined || b.min_rent !== undefined) {
+      rentPricing = normalizeRentPricing(undefined, propertyTypes, {
+        price: b.rent_amount ?? b.min_rent,
+        rent_period: b.rent_period ?? existing.rent_period,
+      });
+    } else if (propertyTypes.join('|') === normalizePropertyTypes(JSON.parse(existing.property_types_json || '[]'), existing.property_type).join('|')) {
+      rentPricing = {
+        pricing: {},
+        minRent: Number(existing.min_rent ?? existing.monthly_rent),
+        maxRent: Number(existing.max_rent ?? existing.monthly_rent),
+        first: { rent_period: existing.rent_period || 'MONTH' },
+      };
+    } else {
+      rentPricing = normalizeRentPricing(undefined, propertyTypes, {
+        price: existing.min_rent ?? existing.monthly_rent,
+        rent_period: existing.rent_period,
+      });
+    }
+    if (rentPricing.error) {
+      return res.status(400).json({ success: false, message: rentPricing.error });
+    }
+    const minRent = rentPricing.minRent;
+    const maxRent = rentPricing.maxRent;
 
     const existingImgs = JSON.parse(existing.images_json || '[]');
     const finalImgs = Array.isArray(b.kept_images)
@@ -964,7 +1040,7 @@ app.put('/api/user/properties/:id', requireAuth, async (req, res) => {
     await db.execute({
       sql: `UPDATE properties SET
         title = ?, property_type = ?, property_types_json = ?, description = ?, target_tenants_desc = ?,
-        min_rent = ?, max_rent = ?, monthly_rent = ?, rent_period = ?, deposit = ?,
+        min_rent = ?, max_rent = ?, monthly_rent = ?, rent_period = ?, type_pricing_json = ?, deposit = ?,
         county = ?, town = ?, estate = ?, pin_lat = ?, pin_lng = ?, pin_label = ?,
         images_json = ?
         WHERE id = ? AND owner_id = ?`,
@@ -974,8 +1050,8 @@ app.put('/api/user/properties/:id', requireAuth, async (req, res) => {
         JSON.stringify(propertyTypes),
         b.description !== undefined ? String(b.description).trim() : existing.description,
         b.target_tenants_desc !== undefined ? String(b.target_tenants_desc).trim() : existing.target_tenants_desc,
-        minRent, maxRent, minRent,
-        b.rent_period !== undefined && ['DAY', 'NIGHT', 'MONTH', 'YEAR'].includes(b.rent_period) ? b.rent_period : existing.rent_period || 'MONTH',
+        minRent, maxRent, minRent, rentPricing.first.rent_period,
+        JSON.stringify(Object.keys(rentPricing.pricing).length ? rentPricing.pricing : existingPricing),
         b.deposit !== undefined ? Number(b.deposit) : Number(existing.deposit),
         b.county !== undefined ? String(b.county).trim() : existing.county,
         b.town !== undefined ? String(b.town).trim() : existing.town,
@@ -996,7 +1072,14 @@ app.put('/api/user/properties/:id', requireAuth, async (req, res) => {
 
 app.get('/api/user/dashboard', requireAuth, async (req, res) => {
   const properties = (await db.execute({ sql: 'SELECT * FROM properties WHERE owner_id = ? ORDER BY created_at DESC', args: [req.user.id] })).rows;
-  const subscriptions = (await db.execute({ sql: 'SELECT * FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC', args: [req.user.id] })).rows;
+  const subscriptions = (await db.execute({
+    sql: `SELECT s.*, p.name AS plan_name
+          FROM subscriptions s
+          LEFT JOIN plans p ON p.id = s.plan_id
+          WHERE s.user_id = ?
+          ORDER BY s.created_at DESC`,
+    args: [req.user.id],
+  })).rows;
   const payments = (await db.execute({ sql: 'SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC', args: [req.user.id] })).rows;
   return res.json({ success: true, data: { user: safeUser(req.user), properties, subscriptions, payments } });
 });
@@ -1304,14 +1387,18 @@ app.put('/api/admin/properties/:id', requireAdmin, async (req, res) => {
   if (!propertyTypes.length) {
     return res.status(400).json({ success: false, message: 'Select at least one valid property type.' });
   }
-  const rentAmount = Number(body.rent_amount ?? existing.min_rent ?? existing.monthly_rent);
-  if (!Number.isFinite(rentAmount) || rentAmount <= 0) {
-    return res.status(400).json({ success: false, message: 'Enter a valid listing price greater than zero.' });
+  let existingPricing = {};
+  try {
+    existingPricing = JSON.parse(existing.type_pricing_json || '{}');
+  } catch {
+    existingPricing = {};
   }
-  const rentPeriod = body.rent_period ?? existing.rent_period ?? 'MONTH';
-  if (!['DAY', 'NIGHT', 'MONTH', 'YEAR'].includes(rentPeriod)) {
-    return res.status(400).json({ success: false, message: 'Select a valid rent period.' });
-  }
+  const rentPricingInput = body.rent_pricing ?? (Object.keys(existingPricing).length ? existingPricing : undefined);
+  const rentPricing = normalizeRentPricing(rentPricingInput, propertyTypes, {
+    price: body.rent_amount ?? existing.min_rent ?? existing.monthly_rent,
+    rent_period: body.rent_period ?? existing.rent_period,
+  });
+  if (rentPricing.error) return res.status(400).json({ success: false, message: rentPricing.error });
   const approvalStatus = body.approval_status ?? existing.approval_status;
   if (!['PENDING_APPROVAL', 'APPROVED', 'REJECTED'].includes(approvalStatus)) {
     return res.status(400).json({ success: false, message: 'Select a valid approval status.' });
@@ -1354,7 +1441,7 @@ app.put('/api/admin/properties/:id', requireAdmin, async (req, res) => {
   await db.execute({
     sql: `UPDATE properties SET
       title = ?, owner_name = ?, property_type = ?, property_types_json = ?,
-      description = ?, target_tenants_desc = ?, min_rent = ?, max_rent = ?, monthly_rent = ?, rent_period = ?,
+      description = ?, target_tenants_desc = ?, min_rent = ?, max_rent = ?, monthly_rent = ?, rent_period = ?, type_pricing_json = ?,
       deposit = ?, county = ?, town = ?, estate = ?, pin_lat = ?, pin_lng = ?, pin_label = ?,
       bedrooms = ?, bathrooms = ?, furnished_status = ?, amenities_json = ?, images_json = ?,
       contact_phone = ?, contact_whatsapp = ?, approval_status = ?, availability_status = ?
@@ -1366,7 +1453,8 @@ app.put('/api/admin/properties/:id', requireAdmin, async (req, res) => {
       JSON.stringify(propertyTypes),
       String(body.description ?? existing.description).trim(),
       String(body.target_tenants_desc ?? existing.target_tenants_desc).trim(),
-      rentAmount, rentAmount, rentAmount, rentPeriod,
+      rentPricing.minRent, rentPricing.maxRent, rentPricing.minRent,
+      rentPricing.first.rent_period, JSON.stringify(rentPricing.pricing),
       numbers.deposit,
       String(body.county ?? existing.county).trim(),
       String(body.town ?? existing.town).trim(),
@@ -1595,7 +1683,11 @@ app.patch('/api/admin/users/:id/suspend', requireAdmin, async (req, res) => {
 });
 
 app.post('/api/admin/users/:id/gift-post', requireAdmin, async (req, res) => {
+  const posts = Number(req.body?.posts);
   const days = Number(req.body?.days);
+  if (!Number.isInteger(posts) || posts < 1 || posts > 1000) {
+    return res.status(400).json({ success: false, message: 'Enter a whole number of posts between 1 and 1000.' });
+  }
   if (!Number.isInteger(days) || days < 1 || days > 3650) {
     return res.status(400).json({ success: false, message: 'Enter a whole number of gifted post days between 1 and 3650.' });
   }
@@ -1608,11 +1700,11 @@ app.post('/api/admin/users/:id/gift-post', requireAdmin, async (req, res) => {
   const startsAt = new Date();
   const expiresAt = new Date(startsAt.getTime() + days * 86400000);
   await db.execute({
-    sql: `INSERT INTO subscriptions (id, user_id, plan_id, source_type, posts_total, posts_used, starts_at, expires_at, status)
-          VALUES (?, ?, NULL, 'FREE_FIRST_POST', 1, 0, ?, ?, 'ACTIVE')`,
-    args: [crypto.randomUUID(), req.params.id, startsAt.toISOString(), expiresAt.toISOString()],
+    sql: `INSERT INTO subscriptions (id, user_id, plan_id, source_type, posts_total, posts_used, starts_at, expires_at, source_label, status)
+          VALUES (?, ?, NULL, 'FREE_FIRST_POST', ?, 0, ?, ?, 'ADMIN_GIFT', 'ACTIVE')`,
+    args: [crypto.randomUUID(), req.params.id, posts, startsAt.toISOString(), expiresAt.toISOString()],
   });
-  return res.json({ success: true, message: `Gifted one post to the user. It can be used until ${expiresAt.toISOString()}.` });
+  return res.json({ success: true, message: `Gifted ${posts} post${posts === 1 ? '' : 's'} to the user. They can be used until ${expiresAt.toISOString()}.` });
 });
 
 app.use((req, res) => {
