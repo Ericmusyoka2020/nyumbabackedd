@@ -49,7 +49,7 @@ const db = createClient({
 
 app.use(helmet());
 const allowedOrigins = [
-  'https://house.stackcrafta.com',
+  'https://house.stackcrafts.com',
   'https://rent.stackcrafts.com',
   'https://main.xyz',
 ];
