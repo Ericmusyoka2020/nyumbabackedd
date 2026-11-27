@@ -36,7 +36,9 @@ const PROPERTY_TYPES = [
   'House',
   'Lodging',
   'Cottage',
+  'Restaurant',
 ];
+const DEFAULT_CONTACT_UNLOCK_PRICES = Object.fromEntries(PROPERTY_TYPES.map((type) => [type, 10]));
 
 const db = createClient({
   url: TURSO_DATABASE_URL,
@@ -44,12 +46,13 @@ const db = createClient({
 });
 
 app.use(helmet());
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+const allowedOrigins = [
+  'https://house.stackcrafta.com',
+  'https://rent.stackcrafts.com',
+  'https://main.xyz',
+];
 app.use(cors({
-  origin: !allowedOrigins.length || allowedOrigins.includes('*') ? '*' : allowedOrigins,
+  origin: allowedOrigins,
 }));
 app.use(express.json({ limit: '4mb' }));
 
@@ -94,9 +97,9 @@ app.get('/api/health', async (req, res) => {
   return res.json({ success: true, database: 'connected' });
 });
 
-app.get('/api', (req, res) => res.json({ success: true, name: 'Nyumba API', health: '/api/health' }));
+app.get('/api', (req, res) => res.json({ success: true, name: 'KejaSasa API', health: '/api/health' }));
 app.get(['/', '/index.html', '/admin', '/admin.html'], (req, res) => {
-  return res.json({ success: true, name: 'Nyumba API', health: '/api/health' });
+  return res.json({ success: true, name: 'KejaSasa API', health: '/api/health' });
 });
 
 function hashPassword(password) {
@@ -164,10 +167,11 @@ async function initDb() {
       value TEXT NOT NULL
     )`,
     `INSERT OR IGNORE INTO system_config (key, value) VALUES
-      ('free_posts_allowed', '1'),
+      ('free_posts_allowed', '5'),
       ('free_post_duration_days', '14'),
-      ('default_post_duration_days', '30'),
-      ('add_photo_price', '30')`,
+      ('add_photo_price', '30'),
+      ('contact_unlock_prices', '${JSON.stringify(DEFAULT_CONTACT_UNLOCK_PRICES)}')`,
+    `UPDATE system_config SET value = '5' WHERE key = 'free_posts_allowed' AND value = '1'`,
     `CREATE TABLE IF NOT EXISTS plans (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -241,6 +245,7 @@ async function initDb() {
       images_json TEXT NOT NULL DEFAULT '[]',
       contact_phone TEXT NOT NULL DEFAULT '',
       contact_whatsapp TEXT NOT NULL DEFAULT '',
+      contact_hidden INTEGER NOT NULL DEFAULT 0,
       approval_status TEXT NOT NULL DEFAULT 'PENDING_APPROVAL' CHECK (approval_status IN ('PENDING_APPROVAL', 'APPROVED', 'REJECTED')),
       availability_status TEXT NOT NULL DEFAULT 'PENDING_APPROVAL' CHECK (availability_status IN ('AVAILABLE', 'OCCUPIED', 'PAUSED', 'EXPIRED', 'PENDING_APPROVAL')),
       priority_score INTEGER NOT NULL DEFAULT 1,
@@ -252,7 +257,7 @@ async function initDb() {
     `CREATE TABLE IF NOT EXISTS payments (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      purpose TEXT NOT NULL CHECK (purpose IN ('POST_PLAN', 'PRIORITY_PROMOTION', 'ADD_PHOTO')),
+      purpose TEXT NOT NULL CHECK (purpose IN ('POST_PLAN', 'PRIORITY_PROMOTION', 'ADD_PHOTO', 'CONTACT_UNLOCK')),
       plan_id TEXT,
       priority_plan_id TEXT,
       property_id TEXT,
@@ -265,6 +270,13 @@ async function initDb() {
       result_desc TEXT,
       expires_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
+    `CREATE TABLE IF NOT EXISTS property_contact_unlocks (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      property_id TEXT NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+      payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+      unlocked_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (user_id, property_id)
     )`,
     `CREATE TABLE IF NOT EXISTS property_reports (
       id TEXT PRIMARY KEY,
@@ -305,10 +317,49 @@ async function initDb() {
   if (!propertyColumns.includes('type_pricing_json')) {
     await db.execute("ALTER TABLE properties ADD COLUMN type_pricing_json TEXT NOT NULL DEFAULT '{}'");
   }
+  if (!propertyColumns.includes('contact_hidden')) {
+    await db.execute('ALTER TABLE properties ADD COLUMN contact_hidden INTEGER NOT NULL DEFAULT 0');
+  }
+  const paymentTable = (await db.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'payments'")).rows[0];
+  if (paymentTable && !String(paymentTable.sql || '').includes('CONTACT_UNLOCK')) {
+    await db.batch([
+      `CREATE TABLE payments_new (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        purpose TEXT NOT NULL CHECK (purpose IN ('POST_PLAN', 'PRIORITY_PROMOTION', 'ADD_PHOTO', 'CONTACT_UNLOCK')),
+        plan_id TEXT,
+        priority_plan_id TEXT,
+        property_id TEXT,
+        pending_photo_data TEXT,
+        amount REAL NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'KES',
+        phone_number TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING',
+        result_code INTEGER,
+        result_desc TEXT,
+        expires_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )`,
+      `INSERT INTO payments_new (
+        id, user_id, purpose, plan_id, priority_plan_id, property_id, pending_photo_data,
+        amount, currency, phone_number, status, result_code, result_desc, expires_at, created_at
+      ) SELECT
+        id, user_id, purpose, plan_id, priority_plan_id, property_id, pending_photo_data,
+        amount, currency, phone_number, status, result_code, result_desc, expires_at, created_at
+      FROM payments`,
+      'DROP TABLE payments',
+      'ALTER TABLE payments_new RENAME TO payments',
+    ], 'write');
+  }
   await db.execute(`
     UPDATE properties
     SET property_types_json = json_array(property_type)
     WHERE property_types_json = '[]' AND property_type != ''
+  `);
+  await db.execute(`
+    UPDATE properties
+    SET availability_status = 'AVAILABLE'
+    WHERE approval_status = 'APPROVED' AND availability_status = 'EXPIRED'
   `);
   await db.execute(`
     UPDATE users
@@ -326,6 +377,24 @@ function normalizePropertyTypes(input, fallbackType = '') {
   return [...new Set(requested
     .map((type) => String(type || '').trim())
     .filter((type) => PROPERTY_TYPES.includes(type)))];
+}
+
+function contactUnlockPrice(property, config) {
+  let prices = {};
+  let storedTypes = [];
+  try {
+    prices = JSON.parse(config.contact_unlock_prices || '{}');
+  } catch {
+    console.error('The configured contact unlock prices are not valid JSON.');
+  }
+  try {
+    storedTypes = JSON.parse(property.property_types_json || '[]');
+  } catch {
+    console.error(`Listing ${property.id} has invalid property type data.`);
+  }
+  const type = normalizePropertyTypes(storedTypes, property.property_type)[0] || property.property_type;
+  const price = Number(prices[type] ?? DEFAULT_CONTACT_UNLOCK_PRICES[type] ?? 10);
+  return Number.isFinite(price) && price >= 1 ? price : 10;
 }
 
 function normalizeRentPricing(input, propertyTypes, fallback = {}) {
@@ -476,7 +545,7 @@ async function sendResetCodeEmail(toEmail, toName, code) {
   if (missingConfiguration.length) {
     throw new Error(`Password reset email is not configured on this API host. Missing: ${missingConfiguration.join(', ')}.`);
   }
-  const resetMessage = `Hello ${toName || 'there'}, your Nyumba password reset verification code is ${code}. Enter this code in the password reset form within 15 minutes. If you did not request this, you can ignore this email.`;
+  const resetMessage = `Hello ${toName || 'there'}, your KejaSasa password reset verification code is ${code}. Enter this code in the password reset form within 15 minutes. If you did not request this, you can ignore this email.`;
   const resp = await fetchUpstream('https://api.emailjs.com/api/v1.0/email/send', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -486,7 +555,7 @@ async function sendResetCodeEmail(toEmail, toName, code) {
       user_id: EMAILJS_PUBLIC_KEY,
       accessToken: EMAILJS_PRIVATE_KEY,
       template_params: {
-        subject: 'Nyumba password reset verification code',
+        subject: 'KejaSasa password reset verification code',
         message: resetMessage,
         content: resetMessage,
         to_email: toEmail,
@@ -814,17 +883,28 @@ app.put('/api/user/contact-profile', requireAuth, async (req, res) => {
 app.get('/api/properties/:id', async (req, res) => {
   try {
     const now = new Date().toISOString();
+    const config = await getConfig();
     const property = (await db.execute({
       sql: `SELECT id, title, property_type, property_types_json, type_pricing_json, owner_name, estate, town, county, min_rent, max_rent,
-                   rent_period, availability_status, contact_phone, contact_whatsapp, pin_lat, pin_lng,
-                   pin_label, description, target_tenants_desc, images_json
+                   rent_period, availability_status,
+                   CASE WHEN expires_at > ? AND contact_hidden = 0 THEN contact_phone ELSE NULL END AS contact_phone,
+                   CASE WHEN expires_at > ? AND contact_hidden = 0 THEN contact_whatsapp ELSE NULL END AS contact_whatsapp,
+                   expires_at, contact_hidden, pin_lat, pin_lng, pin_label, description, target_tenants_desc, images_json
             FROM properties
             WHERE id = ? AND approval_status = 'APPROVED'
-              AND availability_status IN ('AVAILABLE', 'OCCUPIED') AND expires_at > ?`,
-      args: [req.params.id, now],
+              AND availability_status IN ('AVAILABLE', 'OCCUPIED')`,
+      args: [now, now, req.params.id],
     })).rows[0];
     if (!property) return res.status(404).json({ success: false, message: 'This listing is no longer available.' });
-    return res.json({ success: true, data: property });
+    const isLocked = Boolean(property.contact_hidden) || property.expires_at <= now;
+    return res.json({
+      success: true,
+      data: {
+        ...property,
+        contact_locked: isLocked,
+        contact_unlock_price: contactUnlockPrice(property, config),
+      },
+    });
   } catch {
     return res.status(500).json({ success: false, message: 'Failed to load listing details.' });
   }
@@ -834,8 +914,8 @@ app.get('/api/properties', async (req, res) => {
   try {
     const { county, town, property_type, min_rent, max_rent, owner_name, q, sort = 'priority' } = req.query;
     const now = new Date().toISOString();
-    const conds = [`approval_status = 'APPROVED'`, `availability_status IN ('AVAILABLE', 'OCCUPIED')`, `expires_at > ?`];
-    const args = [now];
+    const conds = [`approval_status = 'APPROVED'`, `availability_status IN ('AVAILABLE', 'OCCUPIED')`];
+    const args = [];
 
     if (county) { conds.push('LOWER(county) LIKE LOWER(?)'); args.push(`%${county}%`); }
     if (town) { conds.push('LOWER(town) LIKE LOWER(?)'); args.push(`%${town}%`); }
@@ -867,19 +947,74 @@ app.get('/api/properties', async (req, res) => {
 
     const rows = await db.execute({
       sql: `SELECT id, title, property_type, property_types_json, type_pricing_json, owner_name, estate, town, county, min_rent, max_rent,
-                   rent_period, availability_status, contact_phone, contact_whatsapp, pin_lat, pin_lng,
-                   pin_label, json_extract(images_json, '$[0]') AS cover_image
+                   rent_period, availability_status,
+                   CASE WHEN expires_at > ? AND contact_hidden = 0 THEN contact_phone ELSE NULL END AS contact_phone,
+                   CASE WHEN expires_at > ? AND contact_hidden = 0 THEN contact_whatsapp ELSE NULL END AS contact_whatsapp,
+                   expires_at, contact_hidden, pin_lat, pin_lng, pin_label,
+                   json_extract(images_json, '$[0]') AS cover_image
             FROM properties WHERE ${conds.join(' AND ')} ORDER BY ${orderBy} LIMIT 80`,
-      args,
+      args: [now, now, ...args],
     });
-    return res.json({ success: true, data: rows.rows });
+    const config = await getConfig();
+    return res.json({
+      success: true,
+      data: rows.rows.map((property) => ({
+        ...property,
+        contact_locked: Boolean(property.contact_hidden) || property.expires_at <= now,
+        contact_unlock_price: contactUnlockPrice(property, config),
+      })),
+    });
   } catch {
     return res.status(500).json({ success: false, message: 'Failed to load houses' });
   }
 });
 
+app.get('/api/properties/:id/contact', requireAuth, async (req, res) => {
+  try {
+    const property = (await db.execute({
+      sql: `SELECT id, property_type, property_types_json, contact_phone, contact_whatsapp,
+                   contact_hidden, expires_at
+            FROM properties
+            WHERE id = ? AND approval_status = 'APPROVED'
+              AND availability_status IN ('AVAILABLE', 'OCCUPIED')`,
+      args: [req.params.id],
+    })).rows[0];
+    if (!property) return res.status(404).json({ success: false, message: 'This listing is no longer available.' });
+
+    const unlock = (await db.execute({
+      sql: 'SELECT 1 FROM property_contact_unlocks WHERE user_id = ? AND property_id = ?',
+      args: [req.user.id, property.id],
+    })).rows[0];
+    const isLocked = Boolean(property.contact_hidden) || property.expires_at <= new Date().toISOString();
+    if (isLocked && !unlock) {
+      return res.status(402).json({
+        success: false,
+        code: 'CONTACT_LOCKED',
+        amount: contactUnlockPrice(property, await getConfig()),
+        property_type: normalizePropertyTypes(
+          JSON.parse(property.property_types_json || '[]'),
+          property.property_type,
+        )[0] || property.property_type,
+        message: 'A small payment to KejaSasa is required to unlock this contact. It goes to the system, not the landlord or house owner.',
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        contact_phone: property.contact_phone,
+        contact_whatsapp: property.contact_whatsapp,
+      },
+    });
+  } catch (error) {
+    console.error('Could not load listing contact:', error.message);
+    return res.status(500).json({ success: false, message: 'Could not load listing contact.' });
+  }
+});
+
 // CREATE PROPERTY
 app.post('/api/properties', requireAuth, async (req, res) => {
+  let freePostReserved = false;
   try {
     const callPhone = req.user.call_phone || req.user.phone;
     const waPhone = req.user.whatsapp_phone || req.user.phone;
@@ -905,33 +1040,32 @@ app.post('/api/properties', requireAuth, async (req, res) => {
     }
 
     const cfg = await getConfig();
-    const freeAllowed = Number(cfg.free_posts_allowed || 1);
+    const freePostsAllowed = Number(cfg.free_posts_allowed || 5);
     const freeDays = Number(cfg.free_post_duration_days || 14);
-    const defaultDays = Number(cfg.default_post_duration_days || 30);
+    const requestedImages = Array.isArray(b.images) ? b.images : [];
+    if (requestedImages.length > 3) {
+      return res.status(400).json({ success: false, message: 'A new listing includes up to 3 free photos. Pay the add-photo fee to add a fourth photo later.' });
+    }
 
-    let sub = (await db.execute({
-      sql: `SELECT * FROM subscriptions
-            WHERE user_id = ? AND status = 'ACTIVE' AND posts_used < posts_total AND expires_at > ?
-            ORDER BY created_at ASC LIMIT 1`,
-      args: [req.user.id, new Date().toISOString()],
-    })).rows[0];
-
-    if (!sub && req.user.free_post_used < freeAllowed) {
-      const subId = crypto.randomUUID();
-      const now = new Date();
-      const exp = new Date(now.getTime() + freeDays * 86400000).toISOString();
-      await db.execute({
-        sql: `INSERT INTO subscriptions (id, user_id, plan_id, source_type, posts_total, posts_used, starts_at, expires_at, status)
-              VALUES (?, ?, NULL, 'FREE_FIRST_POST', ?, 0, ?, ?, 'ACTIVE')`,
-        args: [subId, req.user.id, freeAllowed, now.toISOString(), exp],
+    const existingPostCount = Number((await db.execute({
+      sql: 'SELECT COUNT(*) AS count FROM properties WHERE owner_id = ?',
+      args: [req.user.id],
+    })).rows[0].count);
+    await db.execute({
+      sql: 'UPDATE users SET free_post_used = MAX(free_post_used, ?) WHERE id = ?',
+      args: [existingPostCount, req.user.id],
+    });
+    const reservation = await db.execute({
+      sql: 'UPDATE users SET free_post_used = free_post_used + 1 WHERE id = ? AND free_post_used < ?',
+      args: [req.user.id, freePostsAllowed],
+    });
+    if (!reservation.rowsAffected) {
+      return res.status(402).json({
+        success: false,
+        message: `This account has used all ${freePostsAllowed} free listing posts. Contact the administrator if you need more.`,
       });
-      await db.execute({ sql: 'UPDATE users SET free_post_used = free_post_used + 1 WHERE id = ?', args: [req.user.id] });
-      sub = { id: subId, expires_at: exp };
     }
-
-    if (!sub) {
-      return res.status(402).json({ success: false, message: 'No post quota left. Purchase a Post Plan.' });
-    }
+    freePostReserved = true;
 
     const propertyType = propertyTypes[0];
     const title = String(b.title || '').trim() || `${propertyTypes.join(', ')} Listing`;
@@ -939,12 +1073,13 @@ app.post('/api/properties', requireAuth, async (req, res) => {
     const maxRent = rentPricing.maxRent;
     const rentPeriod = rentPricing.first.rent_period;
     const requestedAvailability = rentPricing.availabilityStatus;
-    const images = Array.isArray(b.images) ? b.images.slice(0, 4) : [];
+    const images = requestedImages;
     const amenities = Array.isArray(b.amenities) ? b.amenities : [];
 
     const id = crypto.randomUUID();
     const slug = slugify(`${title}-${b.town || ''}`);
-    const expiresAt = sub.expires_at || new Date(Date.now() + defaultDays * 86400000).toISOString();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + freeDays * 86400000).toISOString();
 
     await db.execute({
       sql: `INSERT INTO properties (
@@ -956,7 +1091,7 @@ app.post('/api/properties', requireAuth, async (req, res) => {
         contact_phone, contact_whatsapp, approval_status, availability_status, expires_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?)`,
       args: [
-        id, slug, req.user.id, req.user.full_name, sub.id, title, propertyType, JSON.stringify(propertyTypes),
+        id, slug, req.user.id, req.user.full_name, null, title, propertyType, JSON.stringify(propertyTypes),
         String(b.description || '').trim(),
         String(b.target_tenants_desc || '').trim(),
         minRent, maxRent, minRent, rentPeriod, JSON.stringify(rentPricing.pricing), Number(b.deposit || 0),
@@ -970,15 +1105,20 @@ app.post('/api/properties', requireAuth, async (req, res) => {
         callPhone, waPhone, requestedAvailability, expiresAt,
       ],
     });
-
-    await db.execute({ sql: 'UPDATE subscriptions SET posts_used = posts_used + 1 WHERE id = ?', args: [sub.id] });
+    freePostReserved = false;
 
     return res.status(201).json({
       success: true,
-      message: 'House submitted! An admin must approve it before it goes live.',
+      message: 'Your free listing was submitted. An admin must approve it before it goes live.',
       data: { id, slug, approval_status: 'PENDING_APPROVAL' },
     });
   } catch (err) {
+    if (freePostReserved) {
+      await db.execute({
+        sql: 'UPDATE users SET free_post_used = MAX(0, free_post_used - 1) WHERE id = ?',
+        args: [req.user.id],
+      }).catch((rollbackError) => console.error('Could not restore a reserved free post:', rollbackError.message));
+    }
     return res.status(500).json({ success: false, message: 'Failed to create house post', error: err.message });
   }
 });
@@ -1043,11 +1183,21 @@ app.put('/api/user/properties/:id', requireAuth, async (req, res) => {
     const maxRent = rentPricing.maxRent;
 
     const existingImgs = JSON.parse(existing.images_json || '[]');
-    const finalImgs = Array.isArray(b.kept_images)
-      ? b.kept_images.filter((img) => existingImgs.includes(img)).slice(0, 4)
+    const keptImages = Array.isArray(b.kept_images)
+      ? b.kept_images.filter((img) => existingImgs.includes(img))
       : existingImgs;
+    const newImages = Array.isArray(b.new_images) ? b.new_images : [];
+    if (newImages.some((image) => typeof image !== 'string' || !image.trim())
+      || (newImages.length && keptImages.length + newImages.length > 3)
+      || keptImages.length + newImages.length > 4) {
+      return res.status(400).json({ success: false, message: 'Up to 3 photos are included for free. Add free photos up to that limit; the fourth photo requires payment.' });
+    }
+    const finalImgs = [...keptImages, ...newImages];
     if (finalImgs.length === 0) {
       return res.status(400).json({ success: false, message: 'A listing must keep at least one photo.' });
+    }
+    if (finalImgs.length > 4) {
+      return res.status(400).json({ success: false, message: 'A listing can have no more than 4 photos.' });
     }
 
     await db.execute({
@@ -1099,7 +1249,9 @@ app.get('/api/user/dashboard', requireAuth, async (req, res) => {
     args: [req.user.id],
   })).rows;
   const payments = (await db.execute({ sql: 'SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC', args: [req.user.id] })).rows;
-  return res.json({ success: true, data: { user: safeUser(req.user), properties, subscriptions, payments } });
+  const dashboardUser = safeUser(req.user);
+  dashboardUser.free_post_used = Math.max(Number(dashboardUser.free_post_used || 0), properties.length);
+  return res.json({ success: true, data: { user: dashboardUser, properties, subscriptions, payments } });
 });
 
 app.patch('/api/user/properties/:id/availability', requireAuth, async (req, res) => {
@@ -1147,10 +1299,9 @@ app.post('/api/alerts/comment', async (req, res) => {
 });
 
 app.get('/api/plans', async (req, res) => {
-  const plans = (await db.execute('SELECT * FROM plans WHERE is_active = 1 ORDER BY price ASC')).rows;
   const priorityPlans = (await db.execute('SELECT * FROM priority_plans WHERE is_active = 1 ORDER BY price ASC')).rows;
   const config = await getConfig();
-  return res.json({ success: true, data: { plans, priorityPlans, config } });
+  return res.json({ success: true, data: { plans: [], priorityPlans, config } });
 });
 
 app.post('/api/payments/initiate', requireAuth, async (req, res) => {
@@ -1161,18 +1312,7 @@ app.post('/api/payments/initiate', requireAuth, async (req, res) => {
     const cfg = await getConfig();
     let amount = 0;
 
-    if (purpose === 'POST_PLAN') {
-      const p = (await db.execute({ sql: 'SELECT * FROM plans WHERE id = ? AND is_active = 1', args: [plan_id] })).rows[0];
-      if (!p) return res.status(404).json({ success: false, message: 'Plan not found' });
-      if (property_id) {
-        const prop = (await db.execute({
-          sql: 'SELECT id FROM properties WHERE id = ? AND owner_id = ?',
-          args: [property_id, req.user.id],
-        })).rows[0];
-        if (!prop) return res.status(404).json({ success: false, message: 'Listing not found' });
-      }
-      amount = Number(p.price);
-    } else if (purpose === 'PRIORITY_PROMOTION') {
+    if (purpose === 'PRIORITY_PROMOTION') {
       const pp = (await db.execute({ sql: 'SELECT * FROM priority_plans WHERE id = ? AND is_active = 1', args: [priority_plan_id] })).rows[0];
       if (!pp) return res.status(404).json({ success: false, message: 'Priority plan not found' });
       if (property_id) {
@@ -1187,11 +1327,37 @@ app.post('/api/payments/initiate', requireAuth, async (req, res) => {
       const prop = (await db.execute({ sql: 'SELECT * FROM properties WHERE id = ? AND owner_id = ?', args: [property_id, req.user.id] })).rows[0];
       if (!prop) return res.status(404).json({ success: false, message: 'House not found' });
       const imgs = JSON.parse(prop.images_json || '[]');
-      if (imgs.length >= 4) return res.status(400).json({ success: false, message: 'Maximum of 4 photos already reached' });
+      if (imgs.length >= 4) return res.status(400).json({ success: false, message: 'Maximum of 4 photos already reached. Three are included; the fourth is added for the configured fee.' });
+      if (imgs.length < 3) return res.status(400).json({ success: false, message: 'Add up to 3 free photos first. The configured fee applies to the fourth photo.' });
       if (!new_photo) return res.status(400).json({ success: false, message: 'Select a photo to add' });
       amount = Number(cfg.add_photo_price || 30);
+    } else if (purpose === 'CONTACT_UNLOCK') {
+      const property = (await db.execute({
+        sql: `SELECT id, property_type, property_types_json, contact_hidden, expires_at
+              FROM properties
+              WHERE id = ? AND approval_status = 'APPROVED'
+                AND availability_status IN ('AVAILABLE', 'OCCUPIED')`,
+        args: [property_id],
+      })).rows[0];
+      if (!property) return res.status(404).json({ success: false, message: 'Listing not found.' });
+      const alreadyUnlocked = (await db.execute({
+        sql: 'SELECT 1 FROM property_contact_unlocks WHERE user_id = ? AND property_id = ?',
+        args: [req.user.id, property.id],
+      })).rows[0];
+      if (alreadyUnlocked) {
+        return res.status(409).json({ success: false, message: 'You have already unlocked this listing contact.' });
+      }
+      if (!property.contact_hidden && property.expires_at > new Date().toISOString()) {
+        return res.status(409).json({ success: false, message: 'This listing contact is currently free to view.' });
+      }
+      amount = contactUnlockPrice(property, cfg);
     } else {
-      return res.status(400).json({ success: false, message: 'Invalid payment purpose' });
+      return res.status(400).json({
+        success: false,
+        message: purpose === 'POST_PLAN'
+          ? 'House and home listings are free. Post plans are no longer offered.'
+          : 'Invalid payment purpose',
+      });
     }
 
     paymentId = crypto.randomUUID();
@@ -1293,11 +1459,24 @@ app.get('/api/payments/:id/verify', requireAuth, async (req, res) => {
           const prop = (await db.execute({ sql: 'SELECT * FROM properties WHERE id = ? AND owner_id = ?', args: [payment.property_id, payment.user_id] })).rows[0];
           if (!prop) return res.status(409).json({ success: false, message: 'The listing is no longer available.' });
           const imgs = JSON.parse(prop.images_json || '[]');
-          if (imgs.length >= 4) return res.status(409).json({ success: false, message: 'The listing already has the maximum number of photos.' });
+          if (imgs.length !== 3) return res.status(409).json({ success: false, message: 'The listing photos changed while payment was pending. The paid fourth photo was not added.' });
           imgs.push(payment.pending_photo_data);
           statements.push({
             sql: 'UPDATE properties SET images_json = ? WHERE id = ? AND owner_id = ?',
             args: [JSON.stringify(imgs), prop.id, payment.user_id],
+          });
+        } else if (payment.purpose === 'CONTACT_UNLOCK' && payment.property_id) {
+          const prop = (await db.execute({
+            sql: `SELECT id FROM properties
+                  WHERE id = ? AND approval_status = 'APPROVED'
+                    AND availability_status IN ('AVAILABLE', 'OCCUPIED')`,
+            args: [payment.property_id],
+          })).rows[0];
+          if (!prop) return res.status(409).json({ success: false, message: 'The listing is no longer available.' });
+          statements.push({
+            sql: `INSERT OR IGNORE INTO property_contact_unlocks (user_id, property_id, payment_id)
+                  VALUES (?, ?, ?)`,
+            args: [payment.user_id, payment.property_id, payment.id],
           });
         }
 
@@ -1352,13 +1531,17 @@ app.get('/api/admin/overview', requireAdmin, async (req, res) => {
 });
 
 app.patch('/api/admin/properties/:id/approve', requireAdmin, async (req, res) => {
-  await db.execute({
+  const config = await getConfig();
+  const expiresAt = new Date(Date.now() + Number(config.free_post_duration_days || 14) * 86400000).toISOString();
+  const result = await db.execute({
     sql: `UPDATE properties
-          SET approval_status = 'APPROVED',
+          SET expires_at = CASE WHEN approval_status = 'APPROVED' THEN expires_at ELSE ? END,
+              approval_status = 'APPROVED',
               availability_status = CASE WHEN availability_status = 'PENDING_APPROVAL' THEN 'AVAILABLE' ELSE availability_status END
           WHERE id = ?`,
-    args: [req.params.id],
+    args: [expiresAt, req.params.id],
   });
+  if (!result.rowsAffected) return res.status(404).json({ success: false, message: 'Listing not found.' });
   return res.json({ success: true, message: 'Property approved and live' });
 });
 
@@ -1422,12 +1605,20 @@ app.put('/api/admin/properties/:id', requireAdmin, async (req, res) => {
   if (!['PENDING_APPROVAL', 'APPROVED', 'REJECTED'].includes(approvalStatus)) {
     return res.status(400).json({ success: false, message: 'Select a valid approval status.' });
   }
+  const startsFreeContactPeriod = existing.approval_status !== 'APPROVED' && approvalStatus === 'APPROVED';
+  const freeContactExpiry = startsFreeContactPeriod
+    ? new Date(Date.now() + Number((await getConfig()).free_post_duration_days || 14) * 86400000).toISOString()
+    : existing.expires_at;
   const requestedAvailabilityStatus = body.availability_status ?? existing.availability_status;
   const availabilityStatus = ['AVAILABLE', 'OCCUPIED'].includes(requestedAvailabilityStatus)
     ? rentPricing.availabilityStatus
     : requestedAvailabilityStatus;
   if (!['AVAILABLE', 'OCCUPIED', 'PAUSED', 'EXPIRED', 'PENDING_APPROVAL'].includes(availabilityStatus)) {
     return res.status(400).json({ success: false, message: 'Select a valid availability status.' });
+  }
+  const contactHiddenValue = body.contact_hidden ?? existing.contact_hidden;
+  if (typeof contactHiddenValue !== 'boolean' && contactHiddenValue !== 0 && contactHiddenValue !== 1) {
+    return res.status(400).json({ success: false, message: 'Select whether listing contacts should be hidden.' });
   }
 
   const images = body.images !== undefined ? body.images : JSON.parse(existing.images_json || '[]');
@@ -1466,7 +1657,7 @@ app.put('/api/admin/properties/:id', requireAdmin, async (req, res) => {
       description = ?, target_tenants_desc = ?, min_rent = ?, max_rent = ?, monthly_rent = ?, rent_period = ?, type_pricing_json = ?,
       deposit = ?, county = ?, town = ?, estate = ?, pin_lat = ?, pin_lng = ?, pin_label = ?,
       bedrooms = ?, bathrooms = ?, furnished_status = ?, amenities_json = ?, images_json = ?,
-      contact_phone = ?, contact_whatsapp = ?, approval_status = ?, availability_status = ?
+      contact_phone = ?, contact_whatsapp = ?, contact_hidden = ?, expires_at = ?, approval_status = ?, availability_status = ?
       WHERE id = ?`,
     args: [
       title,
@@ -1491,6 +1682,8 @@ app.put('/api/admin/properties/:id', requireAdmin, async (req, res) => {
       JSON.stringify(images),
       String(body.contact_phone ?? existing.contact_phone).trim(),
       String(body.contact_whatsapp ?? existing.contact_whatsapp).trim(),
+      contactHiddenValue ? 1 : 0,
+      freeContactExpiry,
       approvalStatus,
       availabilityStatus,
       req.params.id,
@@ -1671,13 +1864,16 @@ app.delete('/api/admin/priority-plans/:id', requireAdmin, async (req, res) => {
 
 app.put('/api/admin/config', requireAdmin, async (req, res) => {
   const rules = {
-    add_photo_price: { min: 0, max: 1000000 },
-    free_posts_allowed: { min: 0, max: 100, integer: true },
+    add_photo_price: { min: 1, max: 1000000 },
+    free_posts_allowed: { min: 1, max: 100, integer: true },
     free_post_duration_days: { min: 1, max: 3650, integer: true },
-    default_post_duration_days: { min: 1, max: 3650, integer: true },
   };
-  const entries = Object.entries(req.body || {});
-  if (!entries.length || entries.some(([key, value]) => {
+  const body = req.body || {};
+  const entries = Object.entries(body).filter(([key]) => key !== 'contact_unlock_prices');
+  if (!entries.length && body.contact_unlock_prices === undefined) {
+    return res.status(400).json({ success: false, message: 'Invalid configuration values.' });
+  }
+  if (entries.some(([key, value]) => {
     const rule = rules[key];
     const number = Number(value);
     return !rule || !Number.isFinite(number) || number < rule.min || number > rule.max
@@ -1685,7 +1881,23 @@ app.put('/api/admin/config', requireAdmin, async (req, res) => {
   })) {
     return res.status(400).json({ success: false, message: 'Invalid configuration values.' });
   }
-  await db.batch(entries.map(([key, value]) => ({
+  let contactPricesEntry = null;
+  if (body.contact_unlock_prices !== undefined) {
+    const prices = body.contact_unlock_prices;
+    if (!prices || typeof prices !== 'object' || Array.isArray(prices)
+      || Object.keys(prices).length !== PROPERTY_TYPES.length
+      || PROPERTY_TYPES.some((type) => {
+        const price = Number(prices[type]);
+        return !Object.hasOwn(prices, type) || !Number.isFinite(price) || price < 1 || price > 1000000;
+      })) {
+      return res.status(400).json({ success: false, message: 'Set a valid contact unlock amount for every listing type.' });
+    }
+    contactPricesEntry = ['contact_unlock_prices', JSON.stringify(
+      Object.fromEntries(PROPERTY_TYPES.map((type) => [type, Number(prices[type])])),
+    )];
+  }
+  const configEntries = contactPricesEntry ? [...entries, contactPricesEntry] : entries;
+  await db.batch(configEntries.map(([key, value]) => ({
       sql: `INSERT INTO system_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       args: [key, String(value)],
   })), 'write');
@@ -1752,7 +1964,7 @@ const isDirectExecution = process.argv[1]
   && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isDirectExecution) {
   initDb()
-    .then(() => app.listen(PORT, () => console.log(`Nyumba API running on port ${PORT}`)))
+    .then(() => app.listen(PORT, () => console.log(`KejaSasa API running on port ${PORT}`)))
     .catch((err) => {
       console.error('Database initialization failed:', err.message);
       process.exit(1);
