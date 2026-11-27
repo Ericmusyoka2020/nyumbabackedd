@@ -340,6 +340,7 @@ function normalizeRentPricing(input, propertyTypes, fallback = {}) {
     const price = Number(entry.price ?? entry.rent_amount ?? fallback.price);
     const rentPeriod = entry.rent_period ?? entry.period ?? fallback.rent_period ?? 'MONTH';
     const rentPeriodDays = rentPeriod === 'DAY' ? Number(entry.rent_period_days ?? entry.period_days ?? 1) : 1;
+    const availabilityStatus = entry.availability_status ?? fallback.availability_status ?? 'AVAILABLE';
     if (!Number.isFinite(price) || price <= 0) {
       return { error: `Enter a valid price for ${type}.` };
     }
@@ -349,7 +350,10 @@ function normalizeRentPricing(input, propertyTypes, fallback = {}) {
     if (!Number.isInteger(rentPeriodDays) || rentPeriodDays < 1 || rentPeriodDays > 365) {
       return { error: `The number of days for ${type} must be between 1 and 365.` };
     }
-    pricing[type] = { price, rent_period: rentPeriod, rent_period_days: rentPeriodDays };
+    if (!['AVAILABLE', 'OCCUPIED'].includes(availabilityStatus)) {
+      return { error: `Select whether ${type} is available or occupied.` };
+    }
+    pricing[type] = { price, rent_period: rentPeriod, rent_period_days: rentPeriodDays, availability_status: availabilityStatus };
     prices.push(price);
   }
 
@@ -358,6 +362,9 @@ function normalizeRentPricing(input, propertyTypes, fallback = {}) {
     minRent: Math.min(...prices),
     maxRent: Math.max(...prices),
     first: pricing[propertyTypes[0]],
+    availabilityStatus: Object.values(pricing).some((entry) => entry.availability_status === 'AVAILABLE')
+      ? 'AVAILABLE'
+      : 'OCCUPIED',
   };
 }
 
@@ -813,7 +820,7 @@ app.get('/api/properties/:id', async (req, res) => {
                    pin_label, description, target_tenants_desc, images_json
             FROM properties
             WHERE id = ? AND approval_status = 'APPROVED'
-              AND availability_status = 'AVAILABLE' AND expires_at > ?`,
+              AND availability_status IN ('AVAILABLE', 'OCCUPIED') AND expires_at > ?`,
       args: [req.params.id, now],
     })).rows[0];
     if (!property) return res.status(404).json({ success: false, message: 'This listing is no longer available.' });
@@ -827,7 +834,7 @@ app.get('/api/properties', async (req, res) => {
   try {
     const { county, town, property_type, min_rent, max_rent, owner_name, q, sort = 'priority' } = req.query;
     const now = new Date().toISOString();
-    const conds = [`approval_status = 'APPROVED'`, `availability_status = 'AVAILABLE'`, `expires_at > ?`];
+    const conds = [`approval_status = 'APPROVED'`, `availability_status IN ('AVAILABLE', 'OCCUPIED')`, `expires_at > ?`];
     const args = [now];
 
     if (county) { conds.push('LOWER(county) LIKE LOWER(?)'); args.push(`%${county}%`); }
@@ -891,6 +898,7 @@ app.post('/api/properties', requireAuth, async (req, res) => {
     const rentPricing = normalizeRentPricing(b.rent_pricing, propertyTypes, {
       price: b.rent_amount ?? b.min_rent ?? b.monthly_rent,
       rent_period: b.rent_period,
+      availability_status: b.availability_status,
     });
     if (rentPricing.error) {
       return res.status(400).json({ success: false, message: rentPricing.error });
@@ -930,7 +938,7 @@ app.post('/api/properties', requireAuth, async (req, res) => {
     const minRent = rentPricing.minRent;
     const maxRent = rentPricing.maxRent;
     const rentPeriod = rentPricing.first.rent_period;
-    const requestedAvailability = b.availability_status === 'OCCUPIED' ? 'OCCUPIED' : 'PENDING_APPROVAL';
+    const requestedAvailability = rentPricing.availabilityStatus;
     const images = Array.isArray(b.images) ? b.images.slice(0, 4) : [];
     const amenities = Array.isArray(b.amenities) ? b.amenities : [];
 
@@ -999,11 +1007,14 @@ app.put('/api/user/properties/:id', requireAuth, async (req, res) => {
     }
     let rentPricing;
     if (b.rent_pricing !== undefined) {
-      rentPricing = normalizeRentPricing(b.rent_pricing, propertyTypes);
+      rentPricing = normalizeRentPricing(b.rent_pricing, propertyTypes, {
+
+      });
     } else if (Object.keys(existingPricing).length) {
       rentPricing = normalizeRentPricing(existingPricing, propertyTypes, {
         price: existing.min_rent ?? existing.monthly_rent,
         rent_period: existing.rent_period,
+        availability_status: existing.availability_status,
       });
     } else if (b.rent_amount !== undefined || b.min_rent !== undefined) {
       rentPricing = normalizeRentPricing(undefined, propertyTypes, {
@@ -1016,11 +1027,13 @@ app.put('/api/user/properties/:id', requireAuth, async (req, res) => {
         minRent: Number(existing.min_rent ?? existing.monthly_rent),
         maxRent: Number(existing.max_rent ?? existing.monthly_rent),
         first: { rent_period: existing.rent_period || 'MONTH' },
+        availabilityStatus: existing.availability_status === 'OCCUPIED' ? 'OCCUPIED' : 'AVAILABLE',
       };
     } else {
       rentPricing = normalizeRentPricing(undefined, propertyTypes, {
         price: existing.min_rent ?? existing.monthly_rent,
         rent_period: existing.rent_period,
+        availability_status: existing.availability_status,
       });
     }
     if (rentPricing.error) {
@@ -1041,6 +1054,10 @@ app.put('/api/user/properties/:id', requireAuth, async (req, res) => {
       sql: `UPDATE properties SET
         title = ?, property_type = ?, property_types_json = ?, description = ?, target_tenants_desc = ?,
         min_rent = ?, max_rent = ?, monthly_rent = ?, rent_period = ?, type_pricing_json = ?, deposit = ?,
+        availability_status = CASE
+          WHEN availability_status IN ('AVAILABLE', 'OCCUPIED') THEN ?
+          ELSE availability_status
+        END,
         county = ?, town = ?, estate = ?, pin_lat = ?, pin_lng = ?, pin_label = ?,
         images_json = ?
         WHERE id = ? AND owner_id = ?`,
@@ -1053,6 +1070,7 @@ app.put('/api/user/properties/:id', requireAuth, async (req, res) => {
         minRent, maxRent, minRent, rentPricing.first.rent_period,
         JSON.stringify(Object.keys(rentPricing.pricing).length ? rentPricing.pricing : existingPricing),
         b.deposit !== undefined ? Number(b.deposit) : Number(existing.deposit),
+        rentPricing.availabilityStatus,
         b.county !== undefined ? String(b.county).trim() : existing.county,
         b.town !== undefined ? String(b.town).trim() : existing.town,
         b.estate !== undefined ? String(b.estate).trim() : existing.estate,
@@ -1397,13 +1415,17 @@ app.put('/api/admin/properties/:id', requireAdmin, async (req, res) => {
   const rentPricing = normalizeRentPricing(rentPricingInput, propertyTypes, {
     price: body.rent_amount ?? existing.min_rent ?? existing.monthly_rent,
     rent_period: body.rent_period ?? existing.rent_period,
+    availability_status: existing.availability_status,
   });
   if (rentPricing.error) return res.status(400).json({ success: false, message: rentPricing.error });
   const approvalStatus = body.approval_status ?? existing.approval_status;
   if (!['PENDING_APPROVAL', 'APPROVED', 'REJECTED'].includes(approvalStatus)) {
     return res.status(400).json({ success: false, message: 'Select a valid approval status.' });
   }
-  const availabilityStatus = body.availability_status ?? existing.availability_status;
+  const requestedAvailabilityStatus = body.availability_status ?? existing.availability_status;
+  const availabilityStatus = ['AVAILABLE', 'OCCUPIED'].includes(requestedAvailabilityStatus)
+    ? rentPricing.availabilityStatus
+    : requestedAvailabilityStatus;
   if (!['AVAILABLE', 'OCCUPIED', 'PAUSED', 'EXPIRED', 'PENDING_APPROVAL'].includes(availabilityStatus)) {
     return res.status(400).json({ success: false, message: 'Select a valid availability status.' });
   }
